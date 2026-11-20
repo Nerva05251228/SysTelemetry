@@ -1,0 +1,21 @@
+# Build artifacts & runtime outputs
+dist/
+bin/
+obj/
+release/
+*.exe
+*.sys
+*.pdb
+*.log
+*.tmp
+app.ico
+
+# IDE / Editor
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Local user config & cache
+config.json
+*.bak
