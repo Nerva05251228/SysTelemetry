@@ -28,6 +28,7 @@ namespace SysTelemetry.UI
             Background = Brushes.Transparent;
             ShowInTaskbar = false;
             Topmost = true;
+            ShowActivated = false;
             ResizeMode = ResizeMode.NoResize;
             SizeToContent = SizeToContent.WidthAndHeight;
             Content = _host;
@@ -102,16 +103,18 @@ namespace SysTelemetry.UI
 
             if (!double.IsNaN(_config.DesktopLeft))
             {
-                Left = _config.DesktopLeft;
-                Top = _config.DesktopTop;
+                if (double.IsNaN(Left) || Math.Abs(Left - _config.DesktopLeft) > 0.1) Left = _config.DesktopLeft;
+                if (double.IsNaN(Top) || Math.Abs(Top - _config.DesktopTop) > 0.1) Top = _config.DesktopTop;
                 _positionedOnce = true;
                 return;
             }
 
             var bounds = System.Windows.Forms.Screen.PrimaryScreen.Bounds;
             Point topRightDip = source.CompositionTarget.TransformFromDevice.Transform(new Point(bounds.Right, bounds.Top));
-            Left = topRightDip.X - ActualWidth - 18.0;
-            Top = topRightDip.Y + (double.IsNaN(_config.DesktopTop) ? 16.0 : _config.DesktopTop);
+            double targetLeft = topRightDip.X - ActualWidth - 18.0;
+            double targetTop = topRightDip.Y + (double.IsNaN(_config.DesktopTop) ? 16.0 : _config.DesktopTop);
+            if (double.IsNaN(Left) || Math.Abs(Left - targetLeft) > 0.1) Left = targetLeft;
+            if (double.IsNaN(Top) || Math.Abs(Top - targetTop) > 0.1) Top = targetTop;
             _positionedOnce = true;
         }
     }

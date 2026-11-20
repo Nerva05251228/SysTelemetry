@@ -38,6 +38,7 @@ namespace SysTelemetry.UI
             Background = Brushes.Transparent;
             ShowInTaskbar = false;
             Topmost = true;
+            ShowActivated = false;
             ResizeMode = ResizeMode.NoResize;
             SizeToContent = SizeToContent.WidthAndHeight;
             Cursor = Cursors.Hand;
@@ -55,7 +56,26 @@ namespace SysTelemetry.UI
         {
             _hwnd = new WindowInteropHelper(this).Handle;
             NativeMethods.ApplyToolWindowStyle(_hwnd, false);
+            var src = HwndSource.FromHwnd(_hwnd);
+            if (src != null) src.AddHook(WndProc);
             RepositionToTaskbar();
+            NativeMethods.EnsureAboveTaskbarNoActivate(_hwnd);
+        }
+
+        private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            if (msg == NativeMethods.WM_MOUSEACTIVATE)
+            {
+                handled = true;
+                return new IntPtr(NativeMethods.MA_NOACTIVATE);
+            }
+            return IntPtr.Zero;
+        }
+
+        public void EnsureAboveTaskbar()
+        {
+            if (_hwnd != IntPtr.Zero && IsVisible)
+                NativeMethods.EnsureAboveTaskbarNoActivate(_hwnd);
         }
 
         public void UpdateMetrics(TelemetrySnapshot snap)
@@ -63,7 +83,7 @@ namespace SysTelemetry.UI
             _lastSnap = snap;
             Redraw();
             RepositionToTaskbar();
-            if (IsVisible) NativeMethods.EnsureTopmostNoActivate(_hwnd);
+            EnsureAboveTaskbar();
         }
 
         public void Redraw()
@@ -145,8 +165,8 @@ namespace SysTelemetry.UI
             }
 
             Point dipPos = fromDevice.Transform(new Point(targetX, targetY));
-            Left = dipPos.X;
-            Top = dipPos.Y;
+            if (double.IsNaN(Left) || Math.Abs(Left - dipPos.X) > 0.1) Left = dipPos.X;
+            if (double.IsNaN(Top) || Math.Abs(Top - dipPos.Y) > 0.1) Top = dipPos.Y;
         }
 
         private static bool IsWin11WidgetsEnabled()

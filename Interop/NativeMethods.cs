@@ -16,6 +16,12 @@ namespace SysTelemetry.Interop
         public const uint SWP_NOMOVE = 0x0002;
         public const uint SWP_NOACTIVATE = 0x0010;
 
+        public const int WM_MOUSEACTIVATE = 0x0021;
+        public const int MA_NOACTIVATE = 3;
+        public const uint GW_HWNDPREV = 3;
+        public const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
+        public const uint WINEVENT_OUTOFCONTEXT = 0x0000;
+
         public const int WM_HOTKEY = 0x0312;
         public const uint MOD_ALT = 0x0001;
         public const uint MOD_CONTROL = 0x0002;
@@ -142,6 +148,31 @@ namespace SysTelemetry.Interop
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
         public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
 
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+
+        public delegate void WinEventDelegate(
+            IntPtr hWinEventHook,
+            uint eventType,
+            IntPtr hwnd,
+            int idObject,
+            int idChild,
+            uint dwEventThread,
+            uint dwmsEventTime);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr SetWinEventHook(
+            uint eventMin,
+            uint eventMax,
+            IntPtr hmodWinEventProc,
+            WinEventDelegate lpfnWinEventProc,
+            uint idProcess,
+            uint idThread,
+            uint dwFlags);
+
+        [DllImport("user32.dll")]
+        public static extern bool UnhookWinEvent(IntPtr hWinEventHook);
+
         public static void ApplyToolWindowStyle(IntPtr hwnd, bool clickThrough)
         {
             if (hwnd == IntPtr.Zero) return;
@@ -152,10 +183,33 @@ namespace SysTelemetry.Interop
             SetWindowLongPtr(hwnd, GWL_EXSTYLE, style);
         }
 
+        public static bool IsWindowAbove(IntPtr candidateAbove, IntPtr subject)
+        {
+            if (candidateAbove == IntPtr.Zero || subject == IntPtr.Zero) return false;
+            IntPtr cur = subject;
+            for (int i = 0; i < 256; i++)
+            {
+                cur = GetWindow(cur, GW_HWNDPREV);
+                if (cur == IntPtr.Zero) return false;
+                if (cur == candidateAbove) return true;
+            }
+            return false;
+        }
+
         public static void EnsureTopmostNoActivate(IntPtr hwnd)
         {
             if (hwnd == IntPtr.Zero) return;
             SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+
+        public static void EnsureAboveTaskbarNoActivate(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return;
+            IntPtr tbHwnd = FindWindow("Shell_TrayWnd", null);
+            if (tbHwnd == IntPtr.Zero || IsWindowAbove(tbHwnd, hwnd))
+            {
+                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
         }
 
         public static bool IsFullscreenAppActive(IntPtr ownTaskbarHwnd, IntPtr ownOverlayHwnd, IntPtr ownPopoverHwnd)

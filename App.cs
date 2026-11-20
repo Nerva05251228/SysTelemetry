@@ -35,6 +35,10 @@ namespace SysTelemetry
         private bool _isSampling;
         private bool _hiddenByFullscreen;
         private EventWaitHandle _wakeEvent;
+        private NativeMethods.WinEventDelegate _winEventProc;
+        private IntPtr _fgHook;
+        private DispatcherTimer _zOrderGuardTimer;
+        private int _zOrderGuardTicks;
 
         private ToolStripMenuItem _miDeskVisible;
         private ToolStripMenuItem _miDeskLocked;
@@ -88,6 +92,7 @@ namespace SysTelemetry
 
             RegisterGlobalHotkeys();
             StartWakeListener();
+            StartForegroundWatch();
             SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
 
             _pollTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(_config.PollIntervalMs) };
@@ -148,6 +153,24 @@ namespace SysTelemetry
             _popover.PollRateChanged += () =>
             {
                 _pollTimer.Interval = TimeSpan.FromMilliseconds(_config.PollIntervalMs);
+            };
+
+            _popover.Deactivated += (s, e) =>
+            {
+                if (!_hiddenByFullscreen)
+                {
+                    _taskbarBar.EnsureAboveTaskbar();
+                    ScheduleZOrderGuard();
+                }
+            };
+
+            _popover.IsVisibleChanged += (s, e) =>
+            {
+                if (!_popover.IsVisible && !_hiddenByFullscreen)
+                {
+                    _taskbarBar.EnsureAboveTaskbar();
+                    ScheduleZOrderGuard();
+                }
             };
         }
 
@@ -402,9 +425,50 @@ namespace SysTelemetry
             }));
         }
 
+        private void StartForegroundWatch()
+        {
+            _zOrderGuardTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(35) };
+            _zOrderGuardTimer.Tick += (s, e) =>
+            {
+                if (!_hiddenByFullscreen && _taskbarBar != null && _taskbarBar.IsVisible)
+                    _taskbarBar.EnsureAboveTaskbar();
+                _zOrderGuardTicks--;
+                if (_zOrderGuardTicks <= 0) _zOrderGuardTimer.Stop();
+            };
+
+            try
+            {
+                _winEventProc = OnForegroundChanged;
+                _fgHook = NativeMethods.SetWinEventHook(
+                    NativeMethods.EVENT_SYSTEM_FOREGROUND,
+                    NativeMethods.EVENT_SYSTEM_FOREGROUND,
+                    IntPtr.Zero,
+                    _winEventProc,
+                    0, 0,
+                    NativeMethods.WINEVENT_OUTOFCONTEXT);
+            }
+            catch { }
+        }
+
+        private void OnForegroundChanged(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
+        {
+            if (_hiddenByFullscreen || _taskbarBar == null || !_taskbarBar.IsVisible) return;
+            _taskbarBar.EnsureAboveTaskbar();
+            ScheduleZOrderGuard();
+        }
+
+        private void ScheduleZOrderGuard()
+        {
+            if (_zOrderGuardTimer == null) return;
+            _zOrderGuardTicks = 4;
+            if (!_zOrderGuardTimer.IsEnabled) _zOrderGuardTimer.Start();
+        }
+
         private void ExitCleanly()
         {
             try { if (_pollTimer != null) _pollTimer.Stop(); } catch { }
+            try { if (_zOrderGuardTimer != null) _zOrderGuardTimer.Stop(); } catch { }
+            try { if (_fgHook != IntPtr.Zero) { NativeMethods.UnhookWinEvent(_fgHook); _fgHook = IntPtr.Zero; } } catch { }
             try { SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged; } catch { }
 
             try

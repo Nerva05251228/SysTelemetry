@@ -2,6 +2,11 @@
 
 All notable changes to **SysTelemetry** will be documented in this file.
 
+## [1.0.1] - 2026-11-20
+
+### Fixed
+- **Taskbar Monitor Flicker on Popover Dismiss**: Added `ShowActivated = false` and `WM_MOUSEACTIVATE -> MA_NOACTIVATE` handling on `TaskbarBarWindow` / `DesktopOverlayWindow`, deferred `TelemetryPopoverWindow` `Deactivated` hide to avoid synchronous `WM_ACTIVATE` Z-order glitches, and added instant `EVENT_SYSTEM_FOREGROUND` (`SetWinEventHook`) + Z-order checking (`IsWindowAbove` against `Shell_TrayWnd`) so the taskbar monitor stays cleanly above the taskbar without blinking when clicking blank space.
+
 ## [1.0.0] - 2026-11-20
 
 ### Added

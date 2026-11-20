@@ -95,6 +95,7 @@ namespace SysTelemetry.UI
             Background = Brushes.Transparent;
             ShowInTaskbar = false;
             Topmost = true;
+            ShowActivated = true;
             ResizeMode = ResizeMode.NoResize;
 
             BuildLayout();
@@ -107,7 +108,10 @@ namespace SysTelemetry.UI
             Deactivated += (s, e) =>
             {
                 _lastDeactivatedUtc = DateTime.UtcNow;
-                Hide();
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (!IsActive && IsVisible) Hide();
+                }));
             };
             PreviewKeyDown += (s, e) =>
             {
