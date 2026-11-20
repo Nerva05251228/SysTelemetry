@@ -8,6 +8,7 @@ namespace SysTelemetry.Interop
     internal static class NativeMethods
     {
         public const int GWL_EXSTYLE = -20;
+        public const int GWLP_HWNDPARENT = -8;
         public const int WS_EX_TRANSPARENT = 0x00000020;
         public const int WS_EX_TOOLWINDOW = 0x00000080;
         public const int WS_EX_NOACTIVATE = 0x08000000;
@@ -129,6 +130,12 @@ namespace SysTelemetry.Interop
         {
             if (IntPtr.Size == 8) SetWindowLongPtr64(hWnd, nIndex, new IntPtr(value));
             else SetWindowLongPtr32(hWnd, nIndex, new IntPtr((int)value));
+        }
+
+        public static void SetWindowOwner(IntPtr hwnd, IntPtr ownerHwnd)
+        {
+            if (hwnd == IntPtr.Zero || ownerHwnd == IntPtr.Zero) return;
+            SetWindowLongPtr(hwnd, GWLP_HWNDPARENT, ownerHwnd.ToInt64());
         }
 
         [DllImport("user32.dll")]

@@ -18,6 +18,7 @@ namespace SysTelemetry.UI
         private bool _isHovered;
         private TelemetrySnapshot _lastSnap;
         private IntPtr _hwnd;
+        private IntPtr _lastOwnerHwnd;
         private MenuItem _miDockToggle;
 
         public event Action BarClicked;
@@ -58,6 +59,14 @@ namespace SysTelemetry.UI
             NativeMethods.ApplyToolWindowStyle(_hwnd, false);
             var src = HwndSource.FromHwnd(_hwnd);
             if (src != null) src.AddHook(WndProc);
+
+            IntPtr tbHwnd = NativeMethods.FindWindow("Shell_TrayWnd", null);
+            if (tbHwnd != IntPtr.Zero)
+            {
+                NativeMethods.SetWindowOwner(_hwnd, tbHwnd);
+                _lastOwnerHwnd = tbHwnd;
+            }
+
             RepositionToTaskbar();
             NativeMethods.EnsureAboveTaskbarNoActivate(_hwnd);
         }
@@ -112,6 +121,12 @@ namespace SysTelemetry.UI
             int targetY;
 
             IntPtr tbHwnd = NativeMethods.FindWindow("Shell_TrayWnd", null);
+            if (tbHwnd != IntPtr.Zero && _lastOwnerHwnd != tbHwnd)
+            {
+                NativeMethods.SetWindowOwner(_hwnd, tbHwnd);
+                _lastOwnerHwnd = tbHwnd;
+            }
+
             IntPtr trayHwnd = tbHwnd != IntPtr.Zero
                 ? NativeMethods.FindWindowEx(tbHwnd, IntPtr.Zero, "TrayNotifyWnd", null)
                 : IntPtr.Zero;

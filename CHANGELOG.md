@@ -2,6 +2,11 @@
 
 All notable changes to **SysTelemetry** will be documented in this file.
 
+## [1.0.3] - 2026-11-20
+
+### Fixed
+- **Permanent Taskbar Window Ownership (`SetWindowOwner`)**: Explicitly bound `Shell_TrayWnd` as the native Win32 owner window of `TaskbarBarWindow` via `SetWindowLongPtr(GWLP_HWNDPARENT)`. In the Windows Window Manager architecture, owned windows are permanently maintained above their owner across all Z-order operations, completely eliminating any possibility of the taskbar monitor dropping beneath `Shell_TrayWnd` when activating or interacting with the Sound flyout, Quick Settings, or other taskbar elements.
+
 ## [1.0.2] - 2026-11-20
 
 ### Fixed
