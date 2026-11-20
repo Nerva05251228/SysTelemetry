@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -139,6 +140,9 @@ namespace SysTelemetry.Interop
         [DllImport("user32.dll")]
         public static extern IntPtr GetForegroundWindow();
 
+        [DllImport("user32.dll")]
+        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
         public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
 
@@ -183,19 +187,6 @@ namespace SysTelemetry.Interop
             SetWindowLongPtr(hwnd, GWL_EXSTYLE, style);
         }
 
-        public static bool IsWindowAbove(IntPtr candidateAbove, IntPtr subject)
-        {
-            if (candidateAbove == IntPtr.Zero || subject == IntPtr.Zero) return false;
-            IntPtr cur = subject;
-            for (int i = 0; i < 256; i++)
-            {
-                cur = GetWindow(cur, GW_HWNDPREV);
-                if (cur == IntPtr.Zero) return false;
-                if (cur == candidateAbove) return true;
-            }
-            return false;
-        }
-
         public static void EnsureTopmostNoActivate(IntPtr hwnd)
         {
             if (hwnd == IntPtr.Zero) return;
@@ -205,11 +196,77 @@ namespace SysTelemetry.Interop
         public static void EnsureAboveTaskbarNoActivate(IntPtr hwnd)
         {
             if (hwnd == IntPtr.Zero) return;
-            IntPtr tbHwnd = FindWindow("Shell_TrayWnd", null);
-            if (tbHwnd == IntPtr.Zero || IsWindowAbove(tbHwnd, hwnd))
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+
+        private static readonly string[] ShellProcessNames = new string[]
+        {
+            "explorer",
+            "shellexperiencehost",
+            "shellhost",
+            "startmenuexperiencehost",
+            "searchhost",
+            "textinputhost",
+            "systemsettings",
+            "lockapp",
+            "applicationframehost"
+        };
+
+        private static bool IsSystemShellClass(string className)
+        {
+            if (string.IsNullOrEmpty(className)) return false;
+            if (className == "Progman" ||
+                className == "WorkerW" ||
+                className == "Shell_TrayWnd" ||
+                className == "Shell_SecondaryTrayWnd" ||
+                className == "ControlCenterWindow" ||
+                className == "Windows.UI.Core.CoreWindow" ||
+                className == "Xaml_WindowedPopupClass" ||
+                className == "XamlWindowedPopupClass" ||
+                className == "Shell_LightDismissContent" ||
+                className == "Shell_CharmWindow" ||
+                className == "NotifyIconOverflowWindow" ||
+                className == "TopLevelWindowForOverflow" ||
+                className == "TaskListThumbnailWnd" ||
+                className == "TaskListOverlayWnd" ||
+                className == "MSTaskListWClass" ||
+                className == "DV2ControlHost" ||
+                className == "Button")
             {
-                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                return true;
             }
+
+            if (className.IndexOf("LightDismiss", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                className.IndexOf("Overflow", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                className.IndexOf("ControlCenter", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                className.IndexOf("Popup", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsSystemShellProcess(uint pid)
+        {
+            if (pid == 0) return true;
+            try
+            {
+                using (var proc = Process.GetProcessById((int)pid))
+                {
+                    string name = proc.ProcessName;
+                    for (int i = 0; i < ShellProcessNames.Length; i++)
+                    {
+                        if (name.Equals(ShellProcessNames[i], StringComparison.OrdinalIgnoreCase))
+                            return true;
+                    }
+                }
+            }
+            catch
+            {
+                return false;
+            }
+            return false;
         }
 
         public static bool IsFullscreenAppActive(IntPtr ownTaskbarHwnd, IntPtr ownOverlayHwnd, IntPtr ownPopoverHwnd)
@@ -218,10 +275,15 @@ namespace SysTelemetry.Interop
             if (fg == IntPtr.Zero || fg == ownTaskbarHwnd || fg == ownOverlayHwnd || fg == ownPopoverHwnd)
                 return false;
 
-            var cls = new StringBuilder(64);
+            var cls = new StringBuilder(128);
             GetClassName(fg, cls, cls.Capacity);
             string className = cls.ToString();
-            if (className == "Progman" || className == "WorkerW" || className == "Shell_TrayWnd" || className == "Shell_SecondaryTrayWnd")
+            if (IsSystemShellClass(className))
+                return false;
+
+            uint pid;
+            GetWindowThreadProcessId(fg, out pid);
+            if (pid == (uint)Process.GetCurrentProcess().Id || IsSystemShellProcess(pid))
                 return false;
 
             RECT r;

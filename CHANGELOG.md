@@ -2,6 +2,12 @@
 
 All notable changes to **SysTelemetry** will be documented in this file.
 
+## [1.0.2] - 2026-11-20
+
+### Fixed
+- **Taskbar Monitor Disappearing on System Flyout Click (Sound, Network, Battery, Start, Notifications)**: Expanded fullscreen auto-hide detection (`IsFullscreenAppActive`) to explicitly filter out Windows 11 shell UI window classes (`ControlCenterWindow`, `Windows.UI.Core.CoreWindow`, `Xaml_WindowedPopupClass`, `NotifyIconOverflowWindow`, etc.) and system shell processes (`explorer`, `shellexperiencehost`, `shellhost`, `startmenuexperiencehost`, `searchhost`, `textinputhost`, `systemsettings`, etc.). The monitor and desktop overlay will no longer be erroneously hidden when clicking the Sound/Volume mixer, Quick Settings, Wi-Fi, Calendar, or Start menu, while remaining fully responsive to true full-screen games and video players.
+- **Robust Taskbar Z-Order Enforcement**: Replaced fragile relative Z-order climbing with direct, non-activating topmost assertion (`EnsureAboveTaskbarNoActivate`), preventing the taskbar monitor from dropping beneath `Shell_TrayWnd` when clicking tray items.
+
 ## [1.0.1] - 2026-11-20
 
 ### Fixed
