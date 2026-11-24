@@ -22,6 +22,7 @@ namespace SysTelemetry.UI
         private MenuItem _miDockToggle;
 
         public event Action BarClicked;
+        public event Action OpenTrafficRequested;
         public event Action OpenSettingsRequested;
         public event Action ToggleTaskbarDockRequested;
         public event Action ToggleDesktopOverlayRequested;
@@ -203,6 +204,7 @@ namespace SysTelemetry.UI
         {
             var menu = new ContextMenu();
             menu.Items.Add(MakeMenuItem("展开 / 收起详情面板", () => { if (BarClicked != null) BarClicked(); }));
+            menu.Items.Add(MakeMenuItem("流量统计 (SYS.TRAFFIC)", () => { if (OpenTrafficRequested != null) OpenTrafficRequested(); }));
             menu.Items.Add(MakeMenuItem("打开设置 (SYS.CONFIG)", () => { if (OpenSettingsRequested != null) OpenSettingsRequested(); }));
             _miDockToggle = MakeMenuItem("任务栏停靠：切换至右侧", () => { if (ToggleTaskbarDockRequested != null) ToggleTaskbarDockRequested(); });
             menu.Items.Add(_miDockToggle);

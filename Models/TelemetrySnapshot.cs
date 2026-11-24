@@ -33,6 +33,7 @@ namespace SysTelemetry.Models
 
         public double NetDownBytesPerSec { get; set; }
         public double NetUpBytesPerSec { get; set; }
+        public TrafficSnapshot Traffic { get; set; }
 
         public List<double> CpuHistory { get; set; }
         public List<double> GpuHistory { get; set; }

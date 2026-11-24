@@ -24,6 +24,7 @@ namespace SysTelemetry
         private const string WakeEventName = "Local\\SysTelemetry_ShowPopover_Event_v1";
 
         private AppConfig _config;
+        private TrafficMonitorService _trafficMonitor;
         private TelemetryService _telemetry;
         private TaskbarBarWindow _taskbarBar;
         private DesktopOverlayWindow _desktopOverlay;
@@ -73,7 +74,8 @@ namespace SysTelemetry
             base.OnStartup(e);
 
             _config = AppConfig.Load();
-            _telemetry = new TelemetryService();
+            _trafficMonitor = new TrafficMonitorService(_config);
+            _telemetry = new TelemetryService(_trafficMonitor);
 
             _taskbarBar = new TaskbarBarWindow(_config);
             _desktopOverlay = new DesktopOverlayWindow(_config);
@@ -94,6 +96,7 @@ namespace SysTelemetry
             StartWakeListener();
             StartForegroundWatch();
             SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
+            SystemEvents.SessionEnding += OnSessionEnding;
 
             _pollTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(_config.PollIntervalMs) };
             _pollTimer.Tick += async (s, args) => await PollTickAsync();
@@ -116,6 +119,12 @@ namespace SysTelemetry
         private void WireEvents()
         {
             _taskbarBar.BarClicked += TogglePopoverFromBar;
+            _taskbarBar.OpenTrafficRequested += () =>
+            {
+                _popover.ShowTrafficNearTaskbar(_taskbarBar);
+                _popover.UpdateTrafficOnly(_trafficMonitor.GetCurrentSnapshot());
+                TriggerImmediateSampleAsync();
+            };
             _taskbarBar.OpenSettingsRequested += () => _popover.ShowSettingsNearTaskbar(_taskbarBar);
             _taskbarBar.ToggleTaskbarDockRequested += ToggleTaskbarDock;
             _taskbarBar.ToggleDesktopOverlayRequested += ToggleDesktopOverlay;
@@ -155,6 +164,24 @@ namespace SysTelemetry
                 _pollTimer.Interval = TimeSpan.FromMilliseconds(_config.PollIntervalMs);
             };
 
+            _popover.TrafficConfigChanged += () =>
+            {
+                _trafficMonitor.ReloadProxyConfig();
+                _popover.UpdateTrafficOnly(_trafficMonitor.GetCurrentSnapshot());
+            };
+
+            _popover.ResetTodayTrafficRequested += () =>
+            {
+                _trafficMonitor.ResetToday();
+                _popover.UpdateTrafficOnly(_trafficMonitor.GetCurrentSnapshot());
+            };
+
+            _popover.ClearAllTrafficRequested += () =>
+            {
+                _trafficMonitor.ClearAllHistory();
+                _popover.UpdateTrafficOnly(_trafficMonitor.GetCurrentSnapshot());
+            };
+
             _popover.Deactivated += (s, e) =>
             {
                 if (!_hiddenByFullscreen)
@@ -180,6 +207,12 @@ namespace SysTelemetry
             var menu = new ContextMenuStrip();
 
             menu.Items.Add("展开 / 收起面板 (Ctrl+Alt+M)", null, (s, e) => TogglePopoverExplicit());
+            menu.Items.Add("流量统计 (SYS.TRAFFIC)", null, (s, e) =>
+            {
+                _popover.ShowTrafficNearTaskbar(_taskbarBar);
+                _popover.UpdateTrafficOnly(_trafficMonitor.GetCurrentSnapshot());
+                TriggerImmediateSampleAsync();
+            });
             menu.Items.Add("设置 (SYS.CONFIG)", null, (s, e) => _popover.ShowSettingsNearTaskbar(_taskbarBar));
             menu.Items.Add(new ToolStripSeparator());
 
@@ -340,7 +373,7 @@ namespace SysTelemetry
                     }
                 }
 
-                bool needProcesses = _popover.IsVisible;
+                bool needProcesses = _popover.IsVisible && _popover.IsTelemetryViewActive;
                 TelemetrySnapshot snap = await Task.Run(() => _telemetry.Collect(needProcesses));
 
                 if (!_hiddenByFullscreen)
@@ -464,12 +497,18 @@ namespace SysTelemetry
             if (!_zOrderGuardTimer.IsEnabled) _zOrderGuardTimer.Start();
         }
 
+        private void OnSessionEnding(object sender, SessionEndingEventArgs e)
+        {
+            try { if (_trafficMonitor != null) _trafficMonitor.Flush(); } catch { }
+        }
+
         private void ExitCleanly()
         {
             try { if (_pollTimer != null) _pollTimer.Stop(); } catch { }
             try { if (_zOrderGuardTimer != null) _zOrderGuardTimer.Stop(); } catch { }
             try { if (_fgHook != IntPtr.Zero) { NativeMethods.UnhookWinEvent(_fgHook); _fgHook = IntPtr.Zero; } } catch { }
             try { SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged; } catch { }
+            try { SystemEvents.SessionEnding -= OnSessionEnding; } catch { }
 
             try
             {
@@ -493,6 +532,7 @@ namespace SysTelemetry
             catch { }
 
             try { if (_telemetry != null) _telemetry.Dispose(); } catch { }
+            try { if (_trafficMonitor != null) _trafficMonitor.Dispose(); } catch { }
             try { if (_wakeEvent != null) _wakeEvent.Dispose(); } catch { }
             Shutdown();
         }

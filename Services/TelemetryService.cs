@@ -34,6 +34,7 @@ namespace SysTelemetry.Services
         private long _prevNetTx;
         private readonly Stopwatch _netWatch = new Stopwatch();
         private bool _hasNetBaseline;
+        private readonly TrafficMonitorService _trafficMonitor;
 
         private PerformanceCounter _cpuPerfCounter;
         private PerformanceCounter _diskReadCounter;
@@ -46,8 +47,9 @@ namespace SysTelemetry.Services
         private readonly List<double> _tempHistory = new List<double>(60);
         private readonly int _coreCount = Math.Max(1, Environment.ProcessorCount);
 
-        public TelemetryService()
+        public TelemetryService(TrafficMonitorService trafficMonitor = null)
         {
+            _trafficMonitor = trafficMonitor;
             for (int i = 0; i < 60; i++)
             {
                 _cpuHistory.Add(0);
@@ -57,7 +59,8 @@ namespace SysTelemetry.Services
 
             SampleCpuTimes();
             double dummyRx, dummyTx;
-            SampleNetworkBytes(out dummyRx, out dummyTx);
+            long dummyDRx, dummyDTx;
+            SampleNetworkBytes(out dummyRx, out dummyTx, out dummyDRx, out dummyDTx);
             InitPerformanceCountersAsync();
             InitLibreHardwareMonitorAsync();
         }
@@ -142,9 +145,12 @@ namespace SysTelemetry.Services
             snap.CpuLoadPercent = SampleCpuTimes();
             SampleMemory(snap);
             double rxRate, txRate;
-            SampleNetworkBytes(out rxRate, out txRate);
+            long deltaRx, deltaTx;
+            SampleNetworkBytes(out rxRate, out txRate, out deltaRx, out deltaTx);
             snap.NetDownBytesPerSec = rxRate;
             snap.NetUpBytesPerSec = txRate;
+            if (_trafficMonitor != null)
+                snap.Traffic = _trafficMonitor.RecordSampleAndBuildSnapshot(deltaRx, deltaTx);
 
             SampleDiskCounters(snap);
             SampleHardwareSensors(snap);
@@ -227,36 +233,31 @@ namespace SysTelemetry.Services
             snap.MemoryPercent = mem.dwMemoryLoad;
         }
 
-        private void SampleNetworkBytes(out double downBytesPerSec, out double upBytesPerSec)
+        private void SampleNetworkBytes(out double downBytesPerSec, out double upBytesPerSec, out long deltaRx, out long deltaTx)
         {
             downBytesPerSec = 0;
             upBytesPerSec = 0;
-            long totalRx = 0;
-            long totalTx = 0;
+            deltaRx = 0;
+            deltaTx = 0;
 
-            try
-            {
-                foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
-                {
-                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
-                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback ||
-                        ni.NetworkInterfaceType == NetworkInterfaceType.Tunnel)
-                        continue;
-
-                    var stats = ni.GetIPStatistics();
-                    totalRx += stats.BytesReceived;
-                    totalTx += stats.BytesSent;
-                }
-            }
-            catch { }
+            long totalRx, totalTx;
+            TrafficMonitorService.ReadPhysicalNetworkBytes(out totalRx, out totalTx);
 
             double sec = _netWatch.Elapsed.TotalSeconds;
             if (_hasNetBaseline && sec > 0.05)
             {
                 long dRx = totalRx - _prevNetRx;
                 long dTx = totalTx - _prevNetTx;
-                if (dRx > 0) downBytesPerSec = dRx / sec;
-                if (dTx > 0) upBytesPerSec = dTx / sec;
+                if (dRx > 0)
+                {
+                    deltaRx = dRx;
+                    downBytesPerSec = dRx / sec;
+                }
+                if (dTx > 0)
+                {
+                    deltaTx = dTx;
+                    upBytesPerSec = dTx / sec;
+                }
             }
 
             _prevNetRx = totalRx;

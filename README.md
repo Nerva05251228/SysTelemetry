@@ -15,8 +15,9 @@
 2. **点击扩展遥测面板 (`TelemetryPopoverWindow`)**
    - **60S TRACE**：`CPU`、`GPU`、`TEMP` 三通道 60 秒实时趋势曲线。
    - **传感器卡片**：`CPU`（负载 / 封装温度 / 功耗 / 主频）、`GPU`（负载 / 核心温度 / 功耗 / 显存）、`MEM`（已用占比 / 可用容量）、`DISK`（NVMe 温度 / 读写速率）。
+   - **今日流量摘要与独立统计页 (`SYS.TRAFFIC`)**：主面板透出实时网速与今日全局/代理汇总，点击或通过顶栏图标切换至 `SYS.TRAFFIC`，查看按天 / 按月（支持自定义每月重置日）的全局与代理总流量、下载/上行拆分、直连占比及 14 天 / 12 周期堆叠柱状图与明细列表。
    - **高占用进程 (`PROCESSES`)**：按 CPU / 内存 / 磁盘 IO 实时采样展示前 5 个高资源占用进程。
-   - **头部快捷工具栏**：桌面单行悬浮角标开关、一键内存工作集清理 `TRIM`（含按钮弹性缩放旋转及 `MEM` 卡片翠绿脉冲反馈动画）、内嵌 `SYS.CONFIG` 设置页切换、关闭按钮。
+   - **头部快捷工具栏**：桌面单行悬浮角标开关、一键内存工作集清理 `TRIM`（含按钮弹性缩放旋转及 `MEM` 卡片翠绿脉冲反馈动画）、`SYS.TRAFFIC` 流量统计页切换、内嵌 `SYS.CONFIG` 设置页切换、关闭按钮。
 
 3. **桌面单行透明角标 (`DesktopOverlayWindow`)**
    - 纯透明无边框单行基础读数，无波形图占用视野，常驻桌面角位（默认右上角）。
@@ -93,6 +94,10 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 | `FullscreenAutoHide` | `true` | 全屏应用时是否自动隐藏浮窗 |
 | `PollIntervalMs` | `1000` | 采样周期（`500` / `1000` / `2000` ms） |
 | `TempWarnThreshold` | `80` | 高温预警阈值（`75` / `80` / `85` °C） |
+| `TrafficResetDay` | `1` | 每月流量统计周期重置日（`1 ~ 31`，小月自动按月底对齐） |
+| `ProxyProcessNames` | `"sing-box,xray,mihomo,v2ray"` | 计入代理流量的进程名列表（逗号分隔，通过内核 ETW 排除回环统计） |
+
+每日流量历史记录持久化保存于 `%APPDATA%\SysTelemetry\traffic.json`（保留近 400 天，变更重置日后自动即时重算当期及历史月度周期）。
 
 ---
 
@@ -107,11 +112,13 @@ SysTelemetry/
 │   └── NativeMethods.cs          # Win32 P/Invoke（窗口穿透、置顶、全屏检测、内存清理）
 ├── Models/
 │   ├── AppConfig.cs              # JSON 配置序列化、校验与持久化
-│   └── TelemetrySnapshot.cs      # 遥测快照与进程指标模型
+│   ├── TelemetrySnapshot.cs      # 遥测快照与进程指标模型
+│   └── TrafficStats.cs           # 每日/周期流量统计模型与持久化结构
 ├── Services/
 │   ├── AutoStartService.cs       # 任务计划程序 / 注册表开机自启管理
 │   ├── TelemetryService.cs       # LibreHardwareMonitor + 性能计数器硬件采样引擎
-│   └── ThemeHelper.cs            # 深浅主题调色板、状态着色与固定宽度格式化
+│   ├── ThemeHelper.cs            # 深浅主题调色板、状态着色与固定宽度格式化
+│   └── TrafficMonitorService.cs  # 物理网卡全局统计 + Windows 内核 ETW 代理流量统计引擎
 ├── UI/
 │   ├── DesktopOverlayWindow.cs   # 桌面单行透明悬浮角标窗口
 │   ├── IconFactory.cs            # 矢量 SVG 图标与动态托盘图标生成器

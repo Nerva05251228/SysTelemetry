@@ -30,6 +30,8 @@ namespace SysTelemetry.Models
     [DataContract]
     public sealed class AppConfig
     {
+        public const string DefaultProxyProcessNames = "sing-box,xray,mihomo,v2ray";
+
         [DataMember] public SkinStyle Skin { get; set; }
         [DataMember] public ThemeMode Theme { get; set; }
         [DataMember] public TaskbarDockMode TaskbarDock { get; set; }
@@ -42,6 +44,8 @@ namespace SysTelemetry.Models
         [DataMember] public int PollIntervalMs { get; set; }
         [DataMember] public int TempWarnThreshold { get; set; }
         [DataMember] public int TaskbarOffsetX { get; set; }
+        [DataMember] public int TrafficResetDay { get; set; }
+        [DataMember] public string ProxyProcessNames { get; set; }
 
         public AppConfig()
         {
@@ -57,6 +61,8 @@ namespace SysTelemetry.Models
             PollIntervalMs = 1000;
             TempWarnThreshold = 80;
             TaskbarOffsetX = 0;
+            TrafficResetDay = 1;
+            ProxyProcessNames = DefaultProxyProcessNames;
         }
 
         public static string ConfigFilePath
@@ -124,6 +130,10 @@ namespace SysTelemetry.Models
                 TempWarnThreshold = 80;
             if (TaskbarOffsetX < -300 || TaskbarOffsetX > 300)
                 TaskbarOffsetX = 0;
+            if (TrafficResetDay < 1 || TrafficResetDay > 31)
+                TrafficResetDay = 1;
+            if (ProxyProcessNames == null)
+                ProxyProcessNames = DefaultProxyProcessNames;
         }
     }
 }

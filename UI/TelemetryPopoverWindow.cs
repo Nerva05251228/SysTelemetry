@@ -6,16 +6,25 @@ using System.Windows.Controls.Primitives;
 using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Interop;
+using System.Windows.Markup;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Media.Effects;
 using System.Windows.Shapes;
+using System.Windows.Threading;
 using SysTelemetry.Interop;
 using SysTelemetry.Models;
 using SysTelemetry.Services;
 
 namespace SysTelemetry.UI
 {
+    public enum PopoverViewMode
+    {
+        Telemetry = 0,
+        Traffic = 1,
+        Settings = 2
+    }
+
     public sealed class TelemetryPopoverWindow : Window
     {
         private static readonly FontFamily UiFont = new FontFamily("Segoe UI Variable, Segoe UI, Microsoft YaHei UI");
@@ -27,13 +36,16 @@ namespace SysTelemetry.UI
         private TextBlock _titleText;
         private Border _btnDesktopToggle;
         private Border _btnTrim;
+        private Border _btnTraffic;
         private Border _btnGear;
         private Border _btnClose;
 
         private Grid _telemetryView;
+        private ScrollViewer _trafficScroll;
+        private StackPanel _trafficView;
         private ScrollViewer _settingsScroll;
         private StackPanel _settingsView;
-        private bool _settingsOpen;
+        private PopoverViewMode _activeView = PopoverViewMode.Telemetry;
         private TaskbarBarWindow _anchorBar;
 
         private Canvas _chartCanvas;
@@ -56,6 +68,52 @@ namespace SysTelemetry.UI
         private Ellipse _diskDot;
         private StackPanel _processRows;
 
+        // Compact NET / TRAFFIC summary strip on Telemetry view
+        private Border _netSummaryCard;
+        private TextBlock _netSummarySpeed;
+        private TextBlock _netSummaryGlobal;
+        private TextBlock _netSummaryGlobalSub;
+        private TextBlock _netSummaryProxy;
+        private Border _netSummaryBarTrack;
+        private Border _netSummaryBarProxy;
+
+        // Dedicated SYS.TRAFFIC view controls
+        private bool _trafficMonthlyMode;
+        private readonly List<Button> _trafficHistoryButtons = new List<Button>();
+        private TextBlock _tfTodaySectionTitle;
+        private TextBlock _tfLiveSpeed;
+        private TextBlock _tfTodayGlobalMain;
+        private TextBlock _tfTodayGlobalSub;
+        private TextBlock _tfTodayProxyMain;
+        private TextBlock _tfTodayProxySub;
+        private TextBlock _tfTodayProxyBadgeText;
+        private Border _tfTodayBarTrack;
+        private Border _tfTodayBarProxy;
+        private TextBlock _tfTodayDirectText;
+        private TextBlock _tfTodayRatioText;
+
+        private TextBlock _tfMonthSectionTitle;
+        private TextBlock _tfResetDayHint;
+        private TextBlock _tfMonthGlobalMain;
+        private TextBlock _tfMonthGlobalSub;
+        private TextBlock _tfMonthProxyMain;
+        private TextBlock _tfMonthProxySub;
+        private TextBlock _tfMonthProxyBadgeText;
+        private Border _tfMonthBarTrack;
+        private Border _tfMonthBarProxy;
+        private TextBlock _tfMonthDirectText;
+        private TextBlock _tfMonthRatioText;
+
+        private TextBlock _tfChartPeak;
+        private Grid _tfChartBarsGrid;
+        private Grid _tfChartLabelsGrid;
+        private StackPanel _tfHistoryRows;
+        private Ellipse _tfStatusDot;
+        private TextBlock _tfStatusText;
+        private Button _tfBtnResetToday;
+        private bool _confirmResetTodayFooter;
+        private DispatcherTimer _confirmResetTimer;
+
         // Settings controls
         private CheckBox _chkAutoStart;
         private CheckBox _chkDeskEnabled;
@@ -65,11 +123,24 @@ namespace SysTelemetry.UI
         private TextBlock _lblOpacity;
         private Slider _sliderOffset;
         private TextBlock _lblOffset;
+        private Border _offsetBadge;
+        private Button _btnResetCorner;
+        private Border _deskLockRow;
+        private Border _deskOpacityRow;
+        private TextBlock _lblTrafficResetDay;
+        private TextBox _txtProxyProcesses;
+        private Button _btnCfgResetToday;
+        private Button _btnCfgClearAll;
+        private bool _confirmCfgResetToday;
+        private bool _confirmCfgClearAll;
         private readonly List<Button> _skinButtons = new List<Button>();
         private readonly List<Button> _themeButtons = new List<Button>();
         private readonly List<Button> _rateButtons = new List<Button>();
         private readonly List<Button> _tempButtons = new List<Button>();
         private readonly List<Button> _dockButtons = new List<Button>();
+        private Brush _rowHoverBrush = Brushes.Transparent;
+        private Brush _accentPrimaryBrush = Brushes.SkyBlue;
+        private Brush _mutedTextBrush = Brushes.Gray;
 
         private TelemetrySnapshot _lastSnap;
         private DateTime _lastDeactivatedUtc = DateTime.MinValue;
@@ -77,6 +148,7 @@ namespace SysTelemetry.UI
 
         public IntPtr Handle { get { return _hwnd; } }
         public bool WasJustDeactivated { get { return (DateTime.UtcNow - _lastDeactivatedUtc).TotalMilliseconds < 220; } }
+        public bool IsTelemetryViewActive { get { return _activeView == PopoverViewMode.Telemetry; } }
 
         public event Action ConfigChanged;
         public event Action DesktopOverlayToggled;
@@ -84,6 +156,9 @@ namespace SysTelemetry.UI
         public event Action ResetDesktopCornerRequested;
         public event Action TrimRequested;
         public event Action PollRateChanged;
+        public event Action TrafficConfigChanged;
+        public event Action ResetTodayTrafficRequested;
+        public event Action ClearAllTrafficRequested;
 
         public TelemetryPopoverWindow(AppConfig config)
         {
@@ -107,6 +182,8 @@ namespace SysTelemetry.UI
             };
             Deactivated += (s, e) =>
             {
+                CommitProxyProcessNames();
+                ClearPendingConfirmStates();
                 _lastDeactivatedUtc = DateTime.UtcNow;
                 Dispatcher.BeginInvoke(new Action(() =>
                 {
@@ -161,16 +238,41 @@ namespace SysTelemetry.UI
 
         public void ShowSettingsNearTaskbar(TaskbarBarWindow bar)
         {
-            SetSettingsMode(true);
+            SetViewMode(PopoverViewMode.Settings);
             ShowNearTaskbar(bar);
+        }
+
+        public void ShowTrafficNearTaskbar(TaskbarBarWindow bar)
+        {
+            SetViewMode(PopoverViewMode.Traffic);
+            ShowNearTaskbar(bar);
+        }
+
+        public void UpdateTrafficOnly(TrafficSnapshot traffic)
+        {
+            if (traffic == null) return;
+            if (_lastSnap == null) _lastSnap = new TelemetrySnapshot();
+            _lastSnap.Traffic = traffic;
+            if (!IsVisible) return;
+            var pal = ThemeHelper.GetPalette(_config.Theme);
+            if (_activeView == PopoverViewMode.Telemetry)
+                UpdateNetSummaryStrip(_lastSnap, pal);
+            else if (_activeView == PopoverViewMode.Traffic)
+                UpdateTrafficView(_lastSnap, pal);
         }
 
         public void UpdateMetrics(TelemetrySnapshot snap)
         {
             _lastSnap = snap;
-            if (!IsVisible || _settingsOpen) return;
+            if (!IsVisible || _activeView == PopoverViewMode.Settings) return;
 
             var pal = ThemeHelper.GetPalette(_config.Theme);
+
+            if (_activeView == PopoverViewMode.Traffic)
+            {
+                UpdateTrafficView(snap, pal);
+                return;
+            }
 
             _cpuMain.Text = snap.CpuTempC.HasValue
                 ? string.Format("{0:0}% · {1:0}°C", snap.CpuLoadPercent, snap.CpuTempC.Value)
@@ -202,8 +304,343 @@ namespace SysTelemetry.UI
                 ? ThemeHelper.GetStatusBrush(pal, snap.DiskTempC.Value, snap.DiskTempC, _config.TempWarnThreshold)
                 : pal.StatusOk;
 
+            UpdateNetSummaryStrip(snap, pal);
             UpdateChartLines(snap);
             UpdateProcessRows(snap.TopProcesses, pal);
+        }
+
+        private void UpdateNetSummaryStrip(TelemetrySnapshot snap, ThemePalette pal)
+        {
+            if (_netSummarySpeed == null) return;
+            _netSummarySpeed.Text = string.Format("↓{0}/s · ↑{1}/s",
+                ThemeHelper.FormatNetSpeed(snap.NetDownBytesPerSec),
+                ThemeHelper.FormatNetSpeed(snap.NetUpBytesPerSec));
+
+            var tf = snap.Traffic;
+            if (tf == null || tf.Today == null)
+            {
+                _netSummaryGlobal.Text = "全局 0 B";
+                _netSummaryGlobalSub.Text = "↓0B ↑0B";
+                _netSummaryProxy.Text = "代理 0 B";
+                UpdateStackedRatioBar(_netSummaryBarTrack, _netSummaryBarProxy, 0, 0, pal);
+                return;
+            }
+
+            var t = tf.Today;
+            _netSummaryGlobal.Text = "全局 " + ThemeHelper.FormatDataSize(t.GlobalTotal);
+            _netSummaryGlobalSub.Text = string.Format(" ↓{0} ↑{1}",
+                ThemeHelper.FormatDataSize(t.GlobalRx, compact: true),
+                ThemeHelper.FormatDataSize(t.GlobalTx, compact: true));
+            _netSummaryProxy.Text = t.GlobalTotal > 0
+                ? string.Format("代理 {0} · {1:0}%", ThemeHelper.FormatDataSize(t.ProxyTotal, compact: true), t.ProxyRatio * 100.0)
+                : "代理 0B";
+            UpdateStackedRatioBar(_netSummaryBarTrack, _netSummaryBarProxy, t.GlobalTotal, t.ProxyRatio, pal);
+        }
+
+        private void UpdateTrafficView(TelemetrySnapshot snap, ThemePalette pal)
+        {
+            if (_tfTodayGlobalMain == null) return;
+            _tfLiveSpeed.Text = string.Format("↓ {0}/s · ↑ {1}/s",
+                ThemeHelper.FormatNetSpeed(snap.NetDownBytesPerSec),
+                ThemeHelper.FormatNetSpeed(snap.NetUpBytesPerSec));
+
+            var tf = snap.Traffic;
+            if (tf == null) return;
+
+            var today = tf.Today;
+            if (today != null)
+            {
+                _tfTodaySectionTitle.Text = "TODAY · " + today.RangeText;
+                _tfTodayGlobalMain.Text = ThemeHelper.FormatDataSize(today.GlobalTotal);
+                _tfTodayGlobalSub.Text = string.Format("↓ {0}  ↑ {1}",
+                    ThemeHelper.FormatDataSize(today.GlobalRx, compact: true),
+                    ThemeHelper.FormatDataSize(today.GlobalTx, compact: true));
+                _tfTodayProxyMain.Text = ThemeHelper.FormatDataSize(today.ProxyTotal);
+                _tfTodayProxySub.Text = string.Format("↓ {0}  ↑ {1}",
+                    ThemeHelper.FormatDataSize(today.ProxyRx, compact: true),
+                    ThemeHelper.FormatDataSize(today.ProxyTx, compact: true));
+                _tfTodayProxyBadgeText.Text = string.Format("{0:0.0}%", today.ProxyRatio * 100.0);
+                UpdateStackedRatioBar(_tfTodayBarTrack, _tfTodayBarProxy, today.GlobalTotal, today.ProxyRatio, pal);
+                _tfTodayDirectText.Text = string.Format("直连 {0} ({1:0.0}%)",
+                    ThemeHelper.FormatDataSize(today.DirectTotal),
+                    today.GlobalTotal > 0 ? (1.0 - today.ProxyRatio) * 100.0 : 0.0);
+                _tfTodayRatioText.Text = string.Format("代理 {0:0.0}%", today.ProxyRatio * 100.0);
+            }
+
+            var cycle = tf.CurrentCycle;
+            if (cycle != null)
+            {
+                _tfMonthSectionTitle.Text = tf.ResetDay == 1
+                    ? "MONTH · " + cycle.Label
+                    : "CYCLE · " + cycle.RangeText;
+                _tfResetDayHint.Text = string.Format("每月 {0} 日重置 ›", tf.ResetDay);
+                _tfMonthGlobalMain.Text = ThemeHelper.FormatDataSize(cycle.GlobalTotal);
+                _tfMonthGlobalSub.Text = string.Format("↓ {0}  ↑ {1}",
+                    ThemeHelper.FormatDataSize(cycle.GlobalRx, compact: true),
+                    ThemeHelper.FormatDataSize(cycle.GlobalTx, compact: true));
+                _tfMonthProxyMain.Text = ThemeHelper.FormatDataSize(cycle.ProxyTotal);
+                _tfMonthProxySub.Text = string.Format("↓ {0}  ↑ {1}",
+                    ThemeHelper.FormatDataSize(cycle.ProxyRx, compact: true),
+                    ThemeHelper.FormatDataSize(cycle.ProxyTx, compact: true));
+                _tfMonthProxyBadgeText.Text = string.Format("{0:0.0}%", cycle.ProxyRatio * 100.0);
+                UpdateStackedRatioBar(_tfMonthBarTrack, _tfMonthBarProxy, cycle.GlobalTotal, cycle.ProxyRatio, pal);
+                _tfMonthDirectText.Text = string.Format("直连 {0} ({1:0.0}%)",
+                    ThemeHelper.FormatDataSize(cycle.DirectTotal),
+                    cycle.GlobalTotal > 0 ? (1.0 - cycle.ProxyRatio) * 100.0 : 0.0);
+                _tfMonthRatioText.Text = string.Format("代理 {0:0.0}%", cycle.ProxyRatio * 100.0);
+            }
+
+            if (_tfStatusDot != null && _tfStatusText != null)
+            {
+                if (!tf.EtwActive)
+                    _tfStatusDot.Fill = pal.StatusWarn;
+                else if (tf.EtwStatusText != null && tf.EtwStatusText.IndexOf("待命", StringComparison.Ordinal) >= 0)
+                    _tfStatusDot.Fill = pal.AccentBlue;
+                else
+                    _tfStatusDot.Fill = pal.StatusOk;
+
+                _tfStatusText.Text = tf.EtwStatusText ?? string.Empty;
+            }
+
+            var series = _trafficMonthlyMode ? tf.MonthlyHistory : tf.DailyHistory;
+            RenderTrafficHistory(series, pal);
+        }
+
+        private static void UpdateStackedRatioBar(Border track, Border proxyFill, long globalTotal, double proxyRatio, ThemePalette pal)
+        {
+            if (track == null || proxyFill == null) return;
+            double trackWidth = track.ActualWidth > 10 ? track.ActualWidth : 304.0;
+            if (globalTotal <= 0)
+            {
+                track.Background = pal.TrackBackground;
+                proxyFill.Width = 0;
+                return;
+            }
+
+            track.Background = pal.DirectBarBrush;
+            proxyFill.Background = pal.ProxyBarBrush;
+            double clamped = Math.Max(0.0, Math.Min(1.0, proxyRatio));
+            double px = clamped * trackWidth;
+            if (clamped > 0.002 && px < 3.0) px = 3.0;
+            proxyFill.Width = Math.Min(trackWidth, px);
+        }
+
+        private void RenderTrafficHistory(List<TrafficPeriodSummary> items, ThemePalette pal)
+        {
+            if (_tfChartBarsGrid == null || _tfChartLabelsGrid == null || _tfHistoryRows == null) return;
+
+            _tfChartBarsGrid.Children.Clear();
+            _tfChartBarsGrid.ColumnDefinitions.Clear();
+            _tfChartLabelsGrid.Children.Clear();
+            _tfChartLabelsGrid.ColumnDefinitions.Clear();
+            _tfHistoryRows.Children.Clear();
+
+            if (items == null || items.Count == 0)
+            {
+                if (_tfChartPeak != null) _tfChartPeak.Text = "峰值 0 B";
+                return;
+            }
+
+            long maxVal = 0;
+            for (int i = 0; i < items.Count; i++)
+            {
+                if (items[i].GlobalTotal > maxVal) maxVal = items[i].GlobalTotal;
+            }
+            if (_tfChartPeak != null)
+                _tfChartPeak.Text = "峰值 " + ThemeHelper.FormatDataSize(maxVal);
+
+            const double maxBarHeight = 46.0;
+            double barWidth = items.Count > 12 ? 10.0 : 12.0;
+
+            for (int i = 0; i < items.Count; i++)
+            {
+                var item = items[i];
+                _tfChartBarsGrid.ColumnDefinitions.Add(new ColumnDefinition());
+                _tfChartLabelsGrid.ColumnDefinitions.Add(new ColumnDefinition());
+
+                string tipText = string.Format(
+                    "{0}\n全局: {1} (↓ {2} / ↑ {3})\n代理: {4} (↓ {5} / ↑ {6})\n直连: {7} · 代理占比 {8:0.0}%",
+                    item.RangeText,
+                    ThemeHelper.FormatDataSize(item.GlobalTotal),
+                    ThemeHelper.FormatDataSize(item.GlobalRx),
+                    ThemeHelper.FormatDataSize(item.GlobalTx),
+                    ThemeHelper.FormatDataSize(item.ProxyTotal),
+                    ThemeHelper.FormatDataSize(item.ProxyRx),
+                    ThemeHelper.FormatDataSize(item.ProxyTx),
+                    ThemeHelper.FormatDataSize(item.DirectTotal),
+                    item.ProxyRatio * 100.0);
+
+                var colHost = new Border
+                {
+                    Background = Brushes.Transparent,
+                    CornerRadius = new CornerRadius(3),
+                    Cursor = Cursors.Hand,
+                    ToolTip = tipText,
+                    VerticalAlignment = VerticalAlignment.Stretch
+                };
+                colHost.MouseEnter += (s, e) => { colHost.Background = _rowHoverBrush; };
+                colHost.MouseLeave += (s, e) => { colHost.Background = Brushes.Transparent; };
+
+                var barStack = new StackPanel
+                {
+                    VerticalAlignment = VerticalAlignment.Bottom,
+                    HorizontalAlignment = HorizontalAlignment.Center
+                };
+
+                if (maxVal <= 0 || item.GlobalTotal <= 0)
+                {
+                    barStack.Children.Add(new Border
+                    {
+                        Width = barWidth,
+                        Height = 2,
+                        CornerRadius = new CornerRadius(1),
+                        Background = pal.TrackBackground,
+                        Opacity = 0.5
+                    });
+                }
+                else
+                {
+                    double totalH = Math.Max(3.0, ((double)item.GlobalTotal / maxVal) * maxBarHeight);
+                    double proxyH = item.ProxyTotal > 0 ? Math.Max(2.0, totalH * item.ProxyRatio) : 0.0;
+                    if (proxyH > totalH) proxyH = totalH;
+                    double directH = Math.Max(0.0, totalH - proxyH);
+
+                    if (directH > 0.5)
+                    {
+                        barStack.Children.Add(new Border
+                        {
+                            Width = barWidth,
+                            Height = directH,
+                            CornerRadius = proxyH > 0.5 ? new CornerRadius(2.5, 2.5, 0, 0) : new CornerRadius(2.5),
+                            Background = pal.DirectBarBrush,
+                            Opacity = item.IsCurrent ? 1.0 : 0.82
+                        });
+                    }
+                    if (proxyH > 0.5)
+                    {
+                        barStack.Children.Add(new Border
+                        {
+                            Width = barWidth,
+                            Height = proxyH,
+                            CornerRadius = directH > 0.5 ? new CornerRadius(0, 0, 1.5, 1.5) : new CornerRadius(2.5),
+                            Background = pal.ProxyBarBrush,
+                            Opacity = item.IsCurrent ? 1.0 : 0.88
+                        });
+                    }
+                }
+
+                colHost.Child = barStack;
+                Grid.SetColumn(colHost, i);
+                _tfChartBarsGrid.Children.Add(colHost);
+
+                // Sparse axis ticks to avoid crowding
+                bool showTick = i == 0 || i == items.Count - 1 ||
+                                (items.Count == 14 && (i == 4 || i == 9)) ||
+                                (items.Count == 12 && (i == 3 || i == 6 || i == 9));
+                if (showTick)
+                {
+                    var tick = new TextBlock
+                    {
+                        Text = item.ShortLabel,
+                        FontFamily = MonoFont,
+                        FontSize = 8.5,
+                        Foreground = item.IsCurrent ? pal.TaskbarTextPrimary : pal.TaskbarTextMuted,
+                        FontWeight = item.IsCurrent ? FontWeights.SemiBold : FontWeights.Normal,
+                        HorizontalAlignment = HorizontalAlignment.Center,
+                        Margin = new Thickness(0, 3, 0, 0)
+                    };
+                    Typography.SetNumeralAlignment(tick, FontNumeralAlignment.Tabular);
+                    Grid.SetColumn(tick, i);
+                    _tfChartLabelsGrid.Children.Add(tick);
+                }
+            }
+
+            // Detail rows newest -> oldest
+            for (int i = items.Count - 1; i >= 0; i--)
+            {
+                var item = items[i];
+                string rowTip = string.Format(
+                    "{0}\n全局: {1} (↓ {2} / ↑ {3})\n代理: {4} (↓ {5} / ↑ {6})\n直连: {7}",
+                    item.RangeText,
+                    ThemeHelper.FormatDataSize(item.GlobalTotal),
+                    ThemeHelper.FormatDataSize(item.GlobalRx),
+                    ThemeHelper.FormatDataSize(item.GlobalTx),
+                    ThemeHelper.FormatDataSize(item.ProxyTotal),
+                    ThemeHelper.FormatDataSize(item.ProxyRx),
+                    ThemeHelper.FormatDataSize(item.ProxyTx),
+                    ThemeHelper.FormatDataSize(item.DirectTotal));
+
+                var rowBorder = new Border
+                {
+                    CornerRadius = new CornerRadius(5),
+                    Padding = new Thickness(6, 3.5, 6, 3.5),
+                    Background = item.IsCurrent ? ThemeHelper.BrushFromHex("#1638BDF8") : Brushes.Transparent,
+                    ToolTip = rowTip
+                };
+                if (!item.IsCurrent)
+                {
+                    rowBorder.MouseEnter += (s, e) => { rowBorder.Background = _rowHoverBrush; };
+                    rowBorder.MouseLeave += (s, e) => { rowBorder.Background = Brushes.Transparent; };
+                }
+
+                var rowGrid = new Grid();
+                rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(72) });
+                rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(72) });
+                rowGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(44) });
+
+                var lblTb = new TextBlock
+                {
+                    Text = item.Label,
+                    FontFamily = MonoFont,
+                    FontSize = 10.5,
+                    FontWeight = item.IsCurrent ? FontWeights.SemiBold : FontWeights.Normal,
+                    Foreground = pal.TaskbarTextPrimary,
+                    TextTrimming = TextTrimming.CharacterEllipsis
+                };
+                Typography.SetNumeralAlignment(lblTb, FontNumeralAlignment.Tabular);
+                Grid.SetColumn(lblTb, 0);
+
+                var globTb = new TextBlock
+                {
+                    Text = ThemeHelper.FormatDataSize(item.GlobalTotal),
+                    FontFamily = MonoFont,
+                    FontSize = 10.5,
+                    Foreground = pal.TaskbarTextPrimary,
+                    TextAlignment = TextAlignment.Right
+                };
+                Typography.SetNumeralAlignment(globTb, FontNumeralAlignment.Tabular);
+                Grid.SetColumn(globTb, 1);
+
+                var proxyTb = new TextBlock
+                {
+                    Text = ThemeHelper.FormatDataSize(item.ProxyTotal),
+                    FontFamily = MonoFont,
+                    FontSize = 10.5,
+                    Foreground = item.ProxyTotal > 0 ? pal.AccentPurple : pal.TaskbarTextMuted,
+                    TextAlignment = TextAlignment.Right
+                };
+                Typography.SetNumeralAlignment(proxyTb, FontNumeralAlignment.Tabular);
+                Grid.SetColumn(proxyTb, 2);
+
+                var pctTb = new TextBlock
+                {
+                    Text = item.GlobalTotal > 0 ? string.Format("{0:0}%", item.ProxyRatio * 100.0) : "--",
+                    FontFamily = MonoFont,
+                    FontSize = 10,
+                    Foreground = pal.TaskbarTextMuted,
+                    TextAlignment = TextAlignment.Right
+                };
+                Typography.SetNumeralAlignment(pctTb, FontNumeralAlignment.Tabular);
+                Grid.SetColumn(pctTb, 3);
+
+                rowGrid.Children.Add(lblTb);
+                rowGrid.Children.Add(globTb);
+                rowGrid.Children.Add(proxyTb);
+                rowGrid.Children.Add(pctTb);
+                rowBorder.Child = rowGrid;
+                _tfHistoryRows.Children.Add(rowBorder);
+            }
         }
 
         private void UpdateChartLines(TelemetrySnapshot snap)
@@ -289,7 +726,7 @@ namespace SysTelemetry.UI
 
             var rootStack = new StackPanel();
 
-            // Header: dot + SYS.TELEMETRY (no 1000ms!) + 4 icon-only square buttons
+            // Header: dot + SYS.TELEMETRY + 5 icon-only square buttons
             var header = new DockPanel { Margin = new Thickness(0, 0, 0, 10) };
 
             var rightButtons = new StackPanel { Orientation = Orientation.Horizontal };
@@ -304,12 +741,21 @@ namespace SysTelemetry.UI
                 SyncSettingsControls();
             });
             _btnTrim = MakeIconButton(IconFactory.TrimBoltSvg, "清理闲置工作集内存", () => { if (TrimRequested != null) TrimRequested(); });
-            _btnGear = MakeIconButton(IconFactory.GearSvg, "设置 (SYS.CONFIG)", () => SetSettingsMode(!_settingsOpen));
+            _btnTraffic = MakeIconButton(IconFactory.TrafficSvg, "流量统计 (SYS.TRAFFIC)", () =>
+            {
+                SetViewMode(_activeView == PopoverViewMode.Traffic ? PopoverViewMode.Telemetry : PopoverViewMode.Traffic);
+            });
+            _btnGear = MakeIconButton(IconFactory.GearSvg, "设置 (SYS.CONFIG)", () =>
+            {
+                SetViewMode(_activeView == PopoverViewMode.Settings ? PopoverViewMode.Telemetry : PopoverViewMode.Settings);
+            });
             _btnClose = MakeIconButton(IconFactory.CloseSvg, "关闭面板", Hide, borderless: true);
 
             rightButtons.Children.Add(_btnDesktopToggle);
             rightButtons.Children.Add(new Border { Width = 5 });
             rightButtons.Children.Add(_btnTrim);
+            rightButtons.Children.Add(new Border { Width = 5 });
+            rightButtons.Children.Add(_btnTraffic);
             rightButtons.Children.Add(new Border { Width = 5 });
             rightButtons.Children.Add(_btnGear);
             rightButtons.Children.Add(new Border { Width = 4 });
@@ -332,18 +778,32 @@ namespace SysTelemetry.UI
             rootStack.Children.Add(header);
 
             BuildTelemetryView();
+            BuildTrafficView();
             BuildSettingsView();
+
+            double maxScrollH = Math.Max(360, SystemParameters.WorkArea.Height - 110);
+            _trafficScroll = new ScrollViewer
+            {
+                Visibility = Visibility.Collapsed,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                MaxHeight = maxScrollH,
+                Content = _trafficView
+            };
+            ApplyThinScrollBarStyle(_trafficScroll);
 
             _settingsScroll = new ScrollViewer
             {
                 Visibility = Visibility.Collapsed,
                 VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
                 HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
-                MaxHeight = Math.Max(360, SystemParameters.WorkArea.Height - 110),
+                MaxHeight = maxScrollH,
                 Content = _settingsView
             };
+            ApplyThinScrollBarStyle(_settingsScroll);
 
             rootStack.Children.Add(_telemetryView);
+            rootStack.Children.Add(_trafficScroll);
             rootStack.Children.Add(_settingsScroll);
 
             _shellBorder.Child = rootStack;
@@ -354,6 +814,7 @@ namespace SysTelemetry.UI
         private void BuildTelemetryView()
         {
             _telemetryView = new Grid();
+            _telemetryView.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             _telemetryView.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             _telemetryView.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             _telemetryView.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
@@ -393,7 +854,7 @@ namespace SysTelemetry.UI
             _telemetryView.Children.Add(chartCard);
 
             // 2x2 Sensor Cards: CPU, GPU, MEM, DISK
-            var sensorGrid = new Grid { Margin = new Thickness(0, 0, 0, 9) };
+            var sensorGrid = new Grid { Margin = new Thickness(0, 0, 0, 7) };
             sensorGrid.ColumnDefinitions.Add(new ColumnDefinition());
             sensorGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(7) });
             sensorGrid.ColumnDefinitions.Add(new ColumnDefinition());
@@ -420,6 +881,126 @@ namespace SysTelemetry.UI
             Grid.SetRow(sensorGrid, 1);
             _telemetryView.Children.Add(sensorGrid);
 
+            // Compact clickable NET / TRAFFIC summary strip
+            _netSummaryCard = new Border
+            {
+                CornerRadius = new CornerRadius(8),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(9, 6, 9, 6),
+                Margin = new Thickness(0, 0, 0, 9),
+                Cursor = Cursors.Hand,
+                ToolTip = "点击查看每日 / 每月全局与代理流量统计",
+                Tag = "SubCard"
+            };
+            _netSummaryCard.MouseEnter += (s, e) =>
+            {
+                var pal = ThemeHelper.GetPalette(_config.Theme);
+                _netSummaryCard.BorderBrush = pal.AccentPrimary;
+            };
+            _netSummaryCard.MouseLeave += (s, e) =>
+            {
+                var pal = ThemeHelper.GetPalette(_config.Theme);
+                _netSummaryCard.BorderBrush = pal.SubSurfaceBorder;
+            };
+            _netSummaryCard.MouseLeftButtonUp += (s, e) =>
+            {
+                e.Handled = true;
+                SetViewMode(PopoverViewMode.Traffic);
+            };
+
+            var netStack = new StackPanel();
+            var netTop = new DockPanel();
+            var netDetailsHint = new TextBlock
+            {
+                Text = "详情 ›",
+                FontFamily = UiFont,
+                FontSize = 10,
+                FontWeight = FontWeights.Medium,
+                Tag = "AccentText",
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            DockPanel.SetDock(netDetailsHint, Dock.Right);
+            netTop.Children.Add(netDetailsHint);
+
+            var netTopLeft = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            netTopLeft.Children.Add(new TextBlock
+            {
+                Text = "NET · 今日",
+                FontFamily = MonoFont,
+                FontSize = 10,
+                FontWeight = FontWeights.SemiBold,
+                Tag = "Muted",
+                Margin = new Thickness(0, 0, 8, 0)
+            });
+            _netSummarySpeed = new TextBlock
+            {
+                Text = "↓0.0K/s · ↑0.0K/s",
+                FontFamily = MonoFont,
+                FontSize = 9.5,
+                Tag = "Muted"
+            };
+            Typography.SetNumeralAlignment(_netSummarySpeed, FontNumeralAlignment.Tabular);
+            netTopLeft.Children.Add(_netSummarySpeed);
+            netTop.Children.Add(netTopLeft);
+            netStack.Children.Add(netTop);
+
+            var netMid = new DockPanel { Margin = new Thickness(0, 3, 0, 4) };
+            _netSummaryProxy = new TextBlock
+            {
+                Text = "代理 0B",
+                FontFamily = MonoFont,
+                FontSize = 10.5,
+                FontWeight = FontWeights.SemiBold,
+                Tag = "PurpleText",
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            Typography.SetNumeralAlignment(_netSummaryProxy, FontNumeralAlignment.Tabular);
+            DockPanel.SetDock(_netSummaryProxy, Dock.Right);
+            netMid.Children.Add(_netSummaryProxy);
+
+            var netMidLeft = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            _netSummaryGlobal = new TextBlock
+            {
+                Text = "全局 0 B",
+                FontFamily = MonoFont,
+                FontSize = 11.5,
+                FontWeight = FontWeights.Bold,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            Typography.SetNumeralAlignment(_netSummaryGlobal, FontNumeralAlignment.Tabular);
+            _netSummaryGlobalSub = new TextBlock
+            {
+                Text = " ↓0B ↑0B",
+                FontFamily = MonoFont,
+                FontSize = 9.5,
+                Tag = "Muted",
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            Typography.SetNumeralAlignment(_netSummaryGlobalSub, FontNumeralAlignment.Tabular);
+            netMidLeft.Children.Add(_netSummaryGlobal);
+            netMidLeft.Children.Add(_netSummaryGlobalSub);
+            netMid.Children.Add(netMidLeft);
+            netStack.Children.Add(netMid);
+
+            _netSummaryBarProxy = new Border
+            {
+                HorizontalAlignment = HorizontalAlignment.Left,
+                Width = 0,
+                CornerRadius = new CornerRadius(1.5)
+            };
+            _netSummaryBarTrack = new Border
+            {
+                Height = 3,
+                CornerRadius = new CornerRadius(1.5),
+                ClipToBounds = true,
+                Child = _netSummaryBarProxy
+            };
+            netStack.Children.Add(_netSummaryBarTrack);
+
+            _netSummaryCard.Child = netStack;
+            Grid.SetRow(_netSummaryCard, 2);
+            _telemetryView.Children.Add(_netSummaryCard);
+
             // Processes (no "TOP 5" text!)
             var procSection = new Border
             {
@@ -438,150 +1019,757 @@ namespace SysTelemetry.UI
             _processRows = new StackPanel();
             procStack.Children.Add(_processRows);
             procSection.Child = procStack;
-            Grid.SetRow(procSection, 2);
+            Grid.SetRow(procSection, 3);
             _telemetryView.Children.Add(procSection);
+        }
+
+        private void BuildTrafficView()
+        {
+            _trafficView = new StackPanel();
+
+            // ── Section 1: TODAY ──
+            var todayHeader = new DockPanel { Margin = new Thickness(3, 0, 3, 4) };
+            _tfLiveSpeed = new TextBlock
+            {
+                Text = "↓ 0.0K/s · ↑ 0.0K/s",
+                FontFamily = MonoFont,
+                FontSize = 9.5,
+                Tag = "Muted",
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            Typography.SetNumeralAlignment(_tfLiveSpeed, FontNumeralAlignment.Tabular);
+            DockPanel.SetDock(_tfLiveSpeed, Dock.Right);
+            todayHeader.Children.Add(_tfLiveSpeed);
+
+            _tfTodaySectionTitle = MakeSectionLabel("TODAY");
+            _tfTodaySectionTitle.Margin = new Thickness(0);
+            todayHeader.Children.Add(_tfTodaySectionTitle);
+            _trafficView.Children.Add(todayHeader);
+
+            _trafficView.Children.Add(BuildTrafficPeriodBlock(
+                out _tfTodayGlobalMain, out _tfTodayGlobalSub,
+                out _tfTodayProxyMain, out _tfTodayProxySub, out _tfTodayProxyBadgeText,
+                out _tfTodayBarTrack, out _tfTodayBarProxy,
+                out _tfTodayDirectText, out _tfTodayRatioText));
+
+            // ── Section 2: MONTH / BILLING CYCLE ──
+            var monthHeader = new DockPanel { Margin = new Thickness(3, 2, 3, 4) };
+            _tfResetDayHint = new TextBlock
+            {
+                Text = "每月 1 日重置 ›",
+                FontFamily = UiFont,
+                FontSize = 10,
+                Tag = "AccentText",
+                Cursor = Cursors.Hand,
+                ToolTip = "点击前往设置修改流量重置日",
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            _tfResetDayHint.MouseLeftButtonUp += (s, e) =>
+            {
+                e.Handled = true;
+                SetViewMode(PopoverViewMode.Settings);
+            };
+            DockPanel.SetDock(_tfResetDayHint, Dock.Right);
+            monthHeader.Children.Add(_tfResetDayHint);
+
+            _tfMonthSectionTitle = MakeSectionLabel("MONTH");
+            _tfMonthSectionTitle.Margin = new Thickness(0);
+            monthHeader.Children.Add(_tfMonthSectionTitle);
+            _trafficView.Children.Add(monthHeader);
+
+            _trafficView.Children.Add(BuildTrafficPeriodBlock(
+                out _tfMonthGlobalMain, out _tfMonthGlobalSub,
+                out _tfMonthProxyMain, out _tfMonthProxySub, out _tfMonthProxyBadgeText,
+                out _tfMonthBarTrack, out _tfMonthBarProxy,
+                out _tfMonthDirectText, out _tfMonthRatioText));
+
+            // ── Section 3: HISTORY CHART + LIST ──
+            var histHead = new DockPanel { Margin = new Thickness(3, 2, 0, 5) };
+            var segTrack = new Border
+            {
+                CornerRadius = new CornerRadius(7),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(2),
+                VerticalAlignment = VerticalAlignment.Center,
+                Tag = "SegTrack"
+            };
+            var segPanel = new StackPanel { Orientation = Orientation.Horizontal };
+            var segTpl = MakeSegmentButtonTemplate();
+            var modeOpts = new[]
+            {
+                Tuple.Create("按天", (object)false),
+                Tuple.Create("按月", (object)true)
+            };
+            foreach (var opt in modeOpts)
+            {
+                var btn = new Button
+                {
+                    Content = opt.Item1,
+                    Tag = opt.Item2,
+                    FontFamily = UiFont,
+                    FontSize = 10,
+                    Padding = new Thickness(8, 2, 8, 2),
+                    Cursor = Cursors.Hand,
+                    Focusable = false,
+                    BorderThickness = new Thickness(1),
+                    Template = segTpl
+                };
+                bool monthly = (bool)opt.Item2;
+                btn.Click += (s, e) =>
+                {
+                    _trafficMonthlyMode = monthly;
+                    var pal = ThemeHelper.GetPalette(_config.Theme);
+                    HighlightSelected(_trafficHistoryButtons, _trafficMonthlyMode, pal);
+                    if (_lastSnap != null) UpdateTrafficView(_lastSnap, pal);
+                };
+                _trafficHistoryButtons.Add(btn);
+                segPanel.Children.Add(btn);
+            }
+            segTrack.Child = segPanel;
+            DockPanel.SetDock(segTrack, Dock.Right);
+            histHead.Children.Add(segTrack);
+
+            var histLeft = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            var histTitle = MakeSectionLabel("HISTORY");
+            histTitle.Margin = new Thickness(0, 0, 8, 0);
+            histLeft.Children.Add(histTitle);
+            histLeft.Children.Add(MakeLegendDot("代理", "#A78BFA"));
+            histLeft.Children.Add(new Border { Width = 7 });
+            histLeft.Children.Add(MakeLegendDot("直连", "#38BDF8"));
+            histHead.Children.Add(histLeft);
+            _trafficView.Children.Add(histHead);
+
+            // Stacked bar chart card
+            var chartCard = new Border
+            {
+                CornerRadius = new CornerRadius(9),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(8, 6, 8, 6),
+                Margin = new Thickness(0, 0, 0, 7),
+                Tag = "SubCard"
+            };
+            var chartCardStack = new StackPanel();
+            _tfChartPeak = new TextBlock
+            {
+                Text = "峰值 0 B",
+                FontFamily = MonoFont,
+                FontSize = 9.5,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                Margin = new Thickness(0, 0, 2, 3),
+                Tag = "Muted"
+            };
+            Typography.SetNumeralAlignment(_tfChartPeak, FontNumeralAlignment.Tabular);
+            chartCardStack.Children.Add(_tfChartPeak);
+
+            _tfChartBarsGrid = new Grid { Height = 48 };
+            chartCardStack.Children.Add(_tfChartBarsGrid);
+
+            _tfChartLabelsGrid = new Grid { Height = 15 };
+            chartCardStack.Children.Add(_tfChartLabelsGrid);
+
+            chartCard.Child = chartCardStack;
+            _trafficView.Children.Add(chartCard);
+
+            // Table column header
+            var colHead = new Grid { Margin = new Thickness(6, 0, 12, 3) };
+            colHead.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            colHead.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(72) });
+            colHead.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(72) });
+            colHead.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(44) });
+
+            var c0 = new TextBlock { Text = "日期 / 周期", FontFamily = UiFont, FontSize = 9.5, Tag = "Muted" };
+            var c1 = new TextBlock { Text = "全局", FontFamily = UiFont, FontSize = 9.5, TextAlignment = TextAlignment.Right, Tag = "Muted" };
+            var c2 = new TextBlock { Text = "代理", FontFamily = UiFont, FontSize = 9.5, TextAlignment = TextAlignment.Right, Tag = "Muted" };
+            var c3 = new TextBlock { Text = "占比", FontFamily = UiFont, FontSize = 9.5, TextAlignment = TextAlignment.Right, Tag = "Muted" };
+            Grid.SetColumn(c0, 0); Grid.SetColumn(c1, 1); Grid.SetColumn(c2, 2); Grid.SetColumn(c3, 3);
+            colHead.Children.Add(c0); colHead.Children.Add(c1); colHead.Children.Add(c2); colHead.Children.Add(c3);
+            _trafficView.Children.Add(colHead);
+
+            _tfHistoryRows = new StackPanel { Margin = new Thickness(0, 0, 2, 0) };
+            var rowsScroll = new ScrollViewer
+            {
+                MaxHeight = 148,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                Content = _tfHistoryRows,
+                Margin = new Thickness(0, 0, 0, 7)
+            };
+            ApplyThinScrollBarStyle(rowsScroll);
+            _trafficView.Children.Add(rowsScroll);
+
+            // ── Footer: ETW status + quick reset ──
+            var footer = new Border
+            {
+                BorderThickness = new Thickness(0, 1, 0, 0),
+                Padding = new Thickness(2, 7, 2, 0),
+                Tag = "Divider"
+            };
+            var footerDp = new DockPanel();
+            _tfBtnResetToday = MakeGhostIconButton(IconFactory.ResetSvg, "重置今日", OnFooterResetTodayClicked);
+            DockPanel.SetDock(_tfBtnResetToday, Dock.Right);
+            footerDp.Children.Add(_tfBtnResetToday);
+
+            var statusLeft = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            _tfStatusDot = new Ellipse { Width = 6, Height = 6, Margin = new Thickness(0, 0, 6, 0), VerticalAlignment = VerticalAlignment.Center };
+            _tfStatusText = new TextBlock
+            {
+                Text = "ETW 初始化中...",
+                FontFamily = MonoFont,
+                FontSize = 9.5,
+                Tag = "Muted",
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                MaxWidth = 215,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            statusLeft.Children.Add(_tfStatusDot);
+            statusLeft.Children.Add(_tfStatusText);
+            footerDp.Children.Add(statusLeft);
+
+            footer.Child = footerDp;
+            _trafficView.Children.Add(footer);
+        }
+
+        private StackPanel BuildTrafficPeriodBlock(
+            out TextBlock globalMain, out TextBlock globalSub,
+            out TextBlock proxyMain, out TextBlock proxySub, out TextBlock proxyBadgeText,
+            out Border barTrack, out Border barProxy,
+            out TextBlock directText, out TextBlock ratioText)
+        {
+            var container = new StackPanel { Margin = new Thickness(0, 0, 0, 8) };
+
+            var cardsGrid = new Grid { Margin = new Thickness(0, 0, 0, 5) };
+            cardsGrid.ColumnDefinitions.Add(new ColumnDefinition());
+            cardsGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(7) });
+            cardsGrid.ColumnDefinitions.Add(new ColumnDefinition());
+
+            // Global card
+            var gCard = new Border
+            {
+                CornerRadius = new CornerRadius(8),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(9, 7, 9, 7),
+                Tag = "SubCard"
+            };
+            var gStack = new StackPanel();
+            var gHead = new DockPanel();
+            var gDot = new Ellipse { Width = 6, Height = 6, VerticalAlignment = VerticalAlignment.Center, Tag = "DirectDot" };
+            DockPanel.SetDock(gDot, Dock.Right);
+            gHead.Children.Add(gDot);
+            gHead.Children.Add(new TextBlock { Text = "全局 GLOBAL", FontFamily = MonoFont, FontSize = 9.5, FontWeight = FontWeights.SemiBold, Tag = "Muted" });
+            gStack.Children.Add(gHead);
+
+            globalMain = new TextBlock { Text = "0 B", FontFamily = MonoFont, FontSize = 13.5, FontWeight = FontWeights.Bold, Margin = new Thickness(0, 2, 0, 1) };
+            Typography.SetNumeralAlignment(globalMain, FontNumeralAlignment.Tabular);
+            globalSub = new TextBlock { Text = "↓ 0B  ↑ 0B", FontFamily = MonoFont, FontSize = 9.5, Tag = "Muted" };
+            Typography.SetNumeralAlignment(globalSub, FontNumeralAlignment.Tabular);
+            gStack.Children.Add(globalMain);
+            gStack.Children.Add(globalSub);
+            gCard.Child = gStack;
+
+            // Proxy card
+            var pCard = new Border
+            {
+                CornerRadius = new CornerRadius(8),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(9, 7, 9, 7),
+                Tag = "SubCard"
+            };
+            var pStack = new StackPanel();
+            var pHead = new DockPanel();
+            proxyBadgeText = new TextBlock
+            {
+                Text = "0.0%",
+                FontFamily = MonoFont,
+                FontSize = 9,
+                FontWeight = FontWeights.SemiBold,
+                Tag = "PurpleText"
+            };
+            Typography.SetNumeralAlignment(proxyBadgeText, FontNumeralAlignment.Tabular);
+            var pBadge = new Border
+            {
+                CornerRadius = new CornerRadius(4),
+                Padding = new Thickness(4, 1, 4, 1),
+                Tag = "ProxyBadge",
+                Child = proxyBadgeText
+            };
+            DockPanel.SetDock(pBadge, Dock.Right);
+            pHead.Children.Add(pBadge);
+            pHead.Children.Add(new TextBlock { Text = "代理 PROXY", FontFamily = MonoFont, FontSize = 9.5, FontWeight = FontWeights.SemiBold, Tag = "Muted", VerticalAlignment = VerticalAlignment.Center });
+            pStack.Children.Add(pHead);
+
+            proxyMain = new TextBlock { Text = "0 B", FontFamily = MonoFont, FontSize = 13.5, FontWeight = FontWeights.Bold, Margin = new Thickness(0, 2, 0, 1) };
+            Typography.SetNumeralAlignment(proxyMain, FontNumeralAlignment.Tabular);
+            proxySub = new TextBlock { Text = "↓ 0B  ↑ 0B", FontFamily = MonoFont, FontSize = 9.5, Tag = "Muted" };
+            Typography.SetNumeralAlignment(proxySub, FontNumeralAlignment.Tabular);
+            pStack.Children.Add(proxyMain);
+            pStack.Children.Add(proxySub);
+            pCard.Child = pStack;
+
+            Grid.SetColumn(gCard, 0);
+            Grid.SetColumn(pCard, 2);
+            cardsGrid.Children.Add(gCard);
+            cardsGrid.Children.Add(pCard);
+            container.Children.Add(cardsGrid);
+
+            barProxy = new Border
+            {
+                HorizontalAlignment = HorizontalAlignment.Left,
+                Width = 0,
+                CornerRadius = new CornerRadius(2)
+            };
+            barTrack = new Border
+            {
+                Height = 4,
+                CornerRadius = new CornerRadius(2),
+                ClipToBounds = true,
+                Margin = new Thickness(1, 0, 1, 3),
+                Child = barProxy
+            };
+            container.Children.Add(barTrack);
+
+            var caption = new DockPanel { Margin = new Thickness(2, 0, 2, 0) };
+            ratioText = new TextBlock { Text = "代理 0.0%", FontFamily = MonoFont, FontSize = 9.5, Tag = "PurpleText" };
+            Typography.SetNumeralAlignment(ratioText, FontNumeralAlignment.Tabular);
+            DockPanel.SetDock(ratioText, Dock.Right);
+            caption.Children.Add(ratioText);
+
+            directText = new TextBlock { Text = "直连 0 B (0.0%)", FontFamily = MonoFont, FontSize = 9.5, Tag = "Muted" };
+            Typography.SetNumeralAlignment(directText, FontNumeralAlignment.Tabular);
+            caption.Children.Add(directText);
+            container.Children.Add(caption);
+
+            return container;
+        }
+
+        private void OnFooterResetTodayClicked()
+        {
+            if (!_confirmResetTodayFooter)
+            {
+                _confirmResetTodayFooter = true;
+                SetGhostButtonLabel(_tfBtnResetToday, "确认重置?");
+                RestartConfirmResetTimer();
+                return;
+            }
+            ClearPendingConfirmStates();
+            if (ResetTodayTrafficRequested != null) ResetTodayTrafficRequested();
+        }
+
+        private void RestartConfirmResetTimer()
+        {
+            if (_confirmResetTimer == null)
+            {
+                _confirmResetTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
+                _confirmResetTimer.Tick += (s, e) =>
+                {
+                    _confirmResetTimer.Stop();
+                    ClearPendingConfirmStates();
+                };
+            }
+            _confirmResetTimer.Stop();
+            _confirmResetTimer.Start();
+        }
+
+        private void ClearPendingConfirmStates()
+        {
+            _confirmResetTodayFooter = false;
+            _confirmCfgResetToday = false;
+            _confirmCfgClearAll = false;
+            SetGhostButtonLabel(_tfBtnResetToday, "重置今日");
+            SetGhostButtonLabel(_btnCfgResetToday, "重置今日");
+            SetGhostButtonLabel(_btnCfgClearAll, "清空全部");
+        }
+
+        private static void SetGhostButtonLabel(Button btn, string text)
+        {
+            if (btn == null) return;
+            var sp = btn.Content as StackPanel;
+            if (sp == null) return;
+            for (int i = 0; i < sp.Children.Count; i++)
+            {
+                var tb = sp.Children[i] as TextBlock;
+                if (tb != null)
+                {
+                    tb.Text = text;
+                    break;
+                }
+            }
         }
 
         private void BuildSettingsView()
         {
             _settingsView = new StackPanel();
 
-            _settingsView.Children.Add(MakeSectionLabel("SYSTEM & OVERLAY"));
+            // ── Group 1: APPEARANCE ──
+            _settingsView.Children.Add(MakeSectionLabel("APPEARANCE"));
 
-            _chkAutoStart = MakeSwitch();
-            _chkAutoStart.Checked += (s, e) => OnAutoStartToggled(true);
-            _chkAutoStart.Unchecked += (s, e) => OnAutoStartToggled(false);
-            _settingsView.Children.Add(MakeSettingRow("开机静默自启", "任务计划高权限自启，免 UAC 弹窗", _chkAutoStart));
-
-            _chkDeskEnabled = MakeSwitch();
-            _chkDeskEnabled.Checked += (s, e) => OnDeskEnabledToggled(true);
-            _chkDeskEnabled.Unchecked += (s, e) => OnDeskEnabledToggled(false);
-            var deskRight = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
-            var resetBtn = new Button
-            {
-                Content = "归位",
-                FontFamily = UiFont,
-                FontSize = 10.5,
-                Padding = new Thickness(7, 2, 7, 2),
-                Margin = new Thickness(0, 0, 7, 0),
-                Cursor = Cursors.Hand,
-                Template = MakeFlatButtonTemplate(new CornerRadius(5)),
-                Tag = "MiniBtn"
-            };
-            resetBtn.Click += (s, e) => { if (ResetDesktopCornerRequested != null) ResetDesktopCornerRequested(); };
-            deskRight.Children.Add(resetBtn);
-            deskRight.Children.Add(_chkDeskEnabled);
-            _settingsView.Children.Add(MakeSettingRow("桌面单行透明角标", "透明底单行基础读数", deskRight));
-
-            _chkDeskLocked = MakeSwitch();
-            _chkDeskLocked.Checked += (s, e) => OnDeskLockToggled(true);
-            _chkDeskLocked.Unchecked += (s, e) => OnDeskLockToggled(false);
-            _settingsView.Children.Add(MakeSettingRow("固定桌面角标位置", "固定即穿透；取消固定可拖拽改位置", _chkDeskLocked));
-
-            _chkFullscreenHide = MakeSwitch();
-            _chkFullscreenHide.Checked += (s, e) => { _config.FullscreenAutoHide = true; _config.Save(); };
-            _chkFullscreenHide.Unchecked += (s, e) => { _config.FullscreenAutoHide = false; _config.Save(); };
-            _settingsView.Children.Add(MakeSettingRow("全屏应用自动隐藏", "全屏游戏 / 视频播放时避让遮挡", _chkFullscreenHide));
-
-            _settingsView.Children.Add(MakeSectionLabel("VISUAL & TELEMETRY"));
-
-            _settingsView.Children.Add(MakeOptionGroupRow("皮肤外观", new[]
+            var skinRow = MakeSegmentedRow(IconFactory.SkinSvg, "皮肤", new[]
             {
                 Tuple.Create("黑白", (object)SkinStyle.Hud),
                 Tuple.Create("Fluent", (object)SkinStyle.Fluent),
                 Tuple.Create("色条", (object)SkinStyle.Lite),
                 Tuple.Create("极简", (object)SkinStyle.Minimal)
-            }, _skinButtons, val =>
+            }, _skinButtons, false, val =>
             {
                 _config.Skin = (SkinStyle)val;
                 _config.Save();
                 if (ConfigChanged != null) ConfigChanged();
                 SyncSettingsControls();
-            }));
+            });
 
-            _settingsView.Children.Add(MakeOptionGroupRow("深浅主题", new[]
+            var themeRow = MakeSegmentedRow(IconFactory.ThemeSvg, "主题", new[]
             {
                 Tuple.Create("自动", (object)ThemeMode.Auto),
                 Tuple.Create("深色", (object)ThemeMode.Dark),
                 Tuple.Create("浅色", (object)ThemeMode.Light)
-            }, _themeButtons, val =>
+            }, _themeButtons, false, val =>
             {
                 _config.Theme = (ThemeMode)val;
                 _config.Save();
                 ApplyThemeColors();
                 if (ConfigChanged != null) ConfigChanged();
                 SyncSettingsControls();
-            }));
+            });
 
-            _settingsView.Children.Add(MakeOptionGroupRow("采样周期", new[]
-            {
-                Tuple.Create("0.5s", (object)500),
-                Tuple.Create("1.0s", (object)1000),
-                Tuple.Create("2.0s", (object)2000)
-            }, _rateButtons, val =>
-            {
-                _config.PollIntervalMs = (int)val;
-                _config.Save();
-                if (PollRateChanged != null) PollRateChanged();
-                SyncSettingsControls();
-            }));
-
-            _settingsView.Children.Add(MakeOptionGroupRow("高温阈值", new[]
-            {
-                Tuple.Create("75°C", (object)75),
-                Tuple.Create("80°C", (object)80),
-                Tuple.Create("85°C", (object)85)
-            }, _tempButtons, val =>
-            {
-                _config.TempWarnThreshold = (int)val;
-                _config.Save();
-                if (ConfigChanged != null) ConfigChanged();
-                SyncSettingsControls();
-            }));
-
-            _lblOpacity = new TextBlock { FontFamily = MonoFont, FontSize = 10.5, Tag = "Muted" };
-            _sliderOpacity = new Slider { Width = 115, Minimum = 35, Maximum = 100, IsSnapToTickEnabled = true, TickFrequency = 1 };
-            _sliderOpacity.ValueChanged += (s, e) =>
-            {
-                if (!IsLoaded) return;
-                _config.DesktopOpacity = Math.Round(_sliderOpacity.Value / 100.0, 2);
-                _lblOpacity.Text = string.Format("{0:0}%", _sliderOpacity.Value);
-                _config.Save();
-                if (DesktopLockChanged != null) DesktopLockChanged();
-            };
-            _settingsView.Children.Add(MakeSliderRow("角标字体透明度", _lblOpacity, _sliderOpacity));
-
-            _settingsView.Children.Add(MakeOptionGroupRow("任务栏停靠", new[]
+            var dockRow = MakeSegmentedRow(IconFactory.DockSvg, "停靠", new[]
             {
                 Tuple.Create("左侧", (object)TaskbarDockMode.Left),
                 Tuple.Create("右侧", (object)TaskbarDockMode.Right)
-            }, _dockButtons, val =>
+            }, _dockButtons, false, val =>
             {
                 _config.TaskbarDock = (TaskbarDockMode)val;
                 _config.Save();
                 if (ConfigChanged != null) ConfigChanged();
                 RepositionBottomAligned();
                 SyncSettingsControls();
-            }));
+            });
 
-            _lblOffset = new TextBlock { FontFamily = MonoFont, FontSize = 10.5, Tag = "Muted" };
-            _sliderOffset = new Slider { Width = 115, Minimum = -200, Maximum = 200, IsSnapToTickEnabled = true, TickFrequency = 5 };
+            _lblOffset = new TextBlock
+            {
+                FontFamily = MonoFont,
+                FontSize = 10.5,
+                TextAlignment = TextAlignment.Right,
+                VerticalAlignment = VerticalAlignment.Center,
+                Tag = "OffsetVal"
+            };
+            Typography.SetNumeralAlignment(_lblOffset, FontNumeralAlignment.Tabular);
+            _offsetBadge = new Border
+            {
+                Width = 42,
+                CornerRadius = new CornerRadius(4),
+                Padding = new Thickness(2, 1, 2, 1),
+                Margin = new Thickness(7, 0, 0, 0),
+                VerticalAlignment = VerticalAlignment.Center,
+                Child = _lblOffset
+            };
+            _offsetBadge.MouseLeftButtonUp += (s, e) =>
+            {
+                if (_config.TaskbarOffsetX != 0)
+                {
+                    e.Handled = true;
+                    _sliderOffset.Value = 0;
+                }
+            };
+            _sliderOffset = MakeMinimalSlider(-200, 200, 5, 114, showFillBar: false, showCenterTick: true);
             _sliderOffset.ValueChanged += (s, e) =>
             {
-                if (!IsLoaded) return;
+                if (!IsLoaded || _suppressSwitchEvents) return;
                 _config.TaskbarOffsetX = (int)_sliderOffset.Value;
-                _lblOffset.Text = string.Format("{0:+0;-0;0}px", _config.TaskbarOffsetX);
+                UpdateOffsetReadout();
                 _config.Save();
                 if (ConfigChanged != null) ConfigChanged();
             };
-            _settingsView.Children.Add(MakeSliderRow("任务栏横向微调", _lblOffset, _sliderOffset));
+            var offsetRow = MakeSliderRow(IconFactory.OffsetSvg, "偏移", _sliderOffset, _offsetBadge);
 
-            var hkRow = new DockPanel { Margin = new Thickness(0, 6, 0, 0) };
-            var hkVal = new TextBlock { Text = "Ctrl+Alt+L / M", FontFamily = MonoFont, FontSize = 10, Tag = "Muted" };
-            DockPanel.SetDock(hkVal, Dock.Right);
-            hkRow.Children.Add(hkVal);
-            hkRow.Children.Add(new TextBlock { Text = "热键：固定切换 / 呼出面板", FontFamily = UiFont, FontSize = 11, Tag = "Muted" });
-            _settingsView.Children.Add(hkRow);
+            _settingsView.Children.Add(MakeGroupCard(skinRow, themeRow, dockRow, offsetRow));
+
+            // ── Group 2: OVERLAY ──
+            _settingsView.Children.Add(MakeSectionLabel("OVERLAY"));
+
+            _chkDeskEnabled = MakeSwitch();
+            _chkDeskEnabled.Checked += (s, e) => OnDeskEnabledToggled(true);
+            _chkDeskEnabled.Unchecked += (s, e) => OnDeskEnabledToggled(false);
+            _btnResetCorner = MakeGhostIconButton(IconFactory.ResetSvg, "归位", () =>
+            {
+                if (ResetDesktopCornerRequested != null) ResetDesktopCornerRequested();
+            });
+            _btnResetCorner.Margin = new Thickness(0, 0, 8, 0);
+            var deskRight = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            deskRight.Children.Add(_btnResetCorner);
+            deskRight.Children.Add(_chkDeskEnabled);
+            var deskRow = MakeToggleRow(IconFactory.DesktopOverlaySvg, "桌面角标", deskRight, _chkDeskEnabled);
+
+            _chkDeskLocked = MakeSwitch();
+            _chkDeskLocked.Checked += (s, e) => OnDeskLockToggled(true);
+            _chkDeskLocked.Unchecked += (s, e) => OnDeskLockToggled(false);
+            _deskLockRow = MakeToggleRow(IconFactory.LockSvg, "锁定穿透", _chkDeskLocked, _chkDeskLocked);
+
+            _lblOpacity = new TextBlock
+            {
+                FontFamily = MonoFont,
+                FontSize = 10.5,
+                Width = 42,
+                TextAlignment = TextAlignment.Right,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(7, 0, 0, 0),
+                Tag = "Muted"
+            };
+            Typography.SetNumeralAlignment(_lblOpacity, FontNumeralAlignment.Tabular);
+            _sliderOpacity = MakeMinimalSlider(35, 100, 1, 114, showFillBar: true, showCenterTick: false);
+            _sliderOpacity.ValueChanged += (s, e) =>
+            {
+                if (!IsLoaded || _suppressSwitchEvents) return;
+                _config.DesktopOpacity = Math.Round(_sliderOpacity.Value / 100.0, 2);
+                _lblOpacity.Text = string.Format("{0:0}%", _sliderOpacity.Value);
+                _config.Save();
+                if (DesktopLockChanged != null) DesktopLockChanged();
+            };
+            _deskOpacityRow = MakeSliderRow(IconFactory.OpacitySvg, "透明度", _sliderOpacity, _lblOpacity);
+
+            _settingsView.Children.Add(MakeGroupCard(deskRow, _deskLockRow, _deskOpacityRow));
+
+            // ── Group 3: SYSTEM ──
+            _settingsView.Children.Add(MakeSectionLabel("SYSTEM"));
+
+            var rateRow = MakeSegmentedRow(IconFactory.RateSvg, "采样", new[]
+            {
+                Tuple.Create("0.5s", (object)500),
+                Tuple.Create("1.0s", (object)1000),
+                Tuple.Create("2.0s", (object)2000)
+            }, _rateButtons, true, val =>
+            {
+                _config.PollIntervalMs = (int)val;
+                _config.Save();
+                if (PollRateChanged != null) PollRateChanged();
+                SyncSettingsControls();
+            });
+
+            var tempRow = MakeSegmentedRow(IconFactory.TempSvg, "预警", new[]
+            {
+                Tuple.Create("75°C", (object)75),
+                Tuple.Create("80°C", (object)80),
+                Tuple.Create("85°C", (object)85)
+            }, _tempButtons, true, val =>
+            {
+                _config.TempWarnThreshold = (int)val;
+                _config.Save();
+                if (ConfigChanged != null) ConfigChanged();
+                SyncSettingsControls();
+            });
+
+            _chkAutoStart = MakeSwitch();
+            _chkAutoStart.Checked += (s, e) => OnAutoStartToggled(true);
+            _chkAutoStart.Unchecked += (s, e) => OnAutoStartToggled(false);
+            var autoStartRow = MakeToggleRow(IconFactory.AutoStartSvg, "开机自启", _chkAutoStart, _chkAutoStart);
+
+            _chkFullscreenHide = MakeSwitch();
+            _chkFullscreenHide.Checked += (s, e) =>
+            {
+                if (_suppressSwitchEvents) return;
+                _config.FullscreenAutoHide = true;
+                _config.Save();
+            };
+            _chkFullscreenHide.Unchecked += (s, e) =>
+            {
+                if (_suppressSwitchEvents) return;
+                _config.FullscreenAutoHide = false;
+                _config.Save();
+            };
+            var fullscreenRow = MakeToggleRow(IconFactory.FullscreenHideSvg, "全屏隐藏", _chkFullscreenHide, _chkFullscreenHide);
+
+            _settingsView.Children.Add(MakeGroupCard(rateRow, tempRow, autoStartRow, fullscreenRow));
+
+            // ── Group 4: TRAFFIC ──
+            _settingsView.Children.Add(MakeSectionLabel("TRAFFIC"));
+
+            var stepTrack = new Border
+            {
+                CornerRadius = new CornerRadius(7),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(2),
+                VerticalAlignment = VerticalAlignment.Center,
+                Tag = "SegTrack"
+            };
+            var stepPanel = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            var stepTpl = MakeSegmentButtonTemplate();
+            var btnDayDec = new Button
+            {
+                Content = "−",
+                FontFamily = MonoFont,
+                FontSize = 11,
+                FontWeight = FontWeights.Bold,
+                Width = 22,
+                Padding = new Thickness(0, 1, 0, 1),
+                Cursor = Cursors.Hand,
+                Focusable = false,
+                BorderThickness = new Thickness(0),
+                Background = Brushes.Transparent,
+                Template = stepTpl,
+                Tag = "StepBtn"
+            };
+            btnDayDec.Click += (s, e) => AdjustTrafficResetDay(-1);
+
+            _lblTrafficResetDay = new TextBlock
+            {
+                Text = "每月 1 日",
+                FontFamily = MonoFont,
+                FontSize = 10.5,
+                FontWeight = FontWeights.SemiBold,
+                Width = 68,
+                TextAlignment = TextAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            Typography.SetNumeralAlignment(_lblTrafficResetDay, FontNumeralAlignment.Tabular);
+
+            var btnDayInc = new Button
+            {
+                Content = "+",
+                FontFamily = MonoFont,
+                FontSize = 11,
+                FontWeight = FontWeights.Bold,
+                Width = 22,
+                Padding = new Thickness(0, 1, 0, 1),
+                Cursor = Cursors.Hand,
+                Focusable = false,
+                BorderThickness = new Thickness(0),
+                Background = Brushes.Transparent,
+                Template = stepTpl,
+                Tag = "StepBtn"
+            };
+            btnDayInc.Click += (s, e) => AdjustTrafficResetDay(1);
+
+            stepPanel.Children.Add(btnDayDec);
+            stepPanel.Children.Add(_lblTrafficResetDay);
+            stepPanel.Children.Add(btnDayInc);
+            stepTrack.Child = stepPanel;
+            var resetDayRow = MakeRowShell(IconFactory.CalendarSvg, "流量重置日", stepTrack);
+
+            // Proxy process names row (header + inline textbox)
+            var proxyRow = new Border
+            {
+                Background = Brushes.Transparent,
+                Padding = new Thickness(10, 6, 10, 7),
+                SnapsToDevicePixels = true
+            };
+            proxyRow.MouseEnter += (s, e) => { proxyRow.Background = _rowHoverBrush; };
+            proxyRow.MouseLeave += (s, e) => { proxyRow.Background = Brushes.Transparent; };
+
+            var proxyStack = new StackPanel();
+            var proxyTop = new DockPanel { Margin = new Thickness(0, 0, 0, 5) };
+            var btnDefaultProxy = MakeGhostIconButton(IconFactory.ResetSvg, "默认", () =>
+            {
+                _config.ProxyProcessNames = AppConfig.DefaultProxyProcessNames;
+                _config.Save();
+                if (_txtProxyProcesses != null) _txtProxyProcesses.Text = _config.ProxyProcessNames;
+                if (TrafficConfigChanged != null) TrafficConfigChanged();
+            });
+            DockPanel.SetDock(btnDefaultProxy, Dock.Right);
+            proxyTop.Children.Add(btnDefaultProxy);
+
+            var proxyLeft = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            var proxyIcon = IconFactory.CreateVectorIcon(IconFactory.ProxySvg, 13, Brushes.Gray, 1.6);
+            proxyIcon.Tag = "RowIcon";
+            proxyIcon.Opacity = 0.85;
+            proxyIcon.Margin = new Thickness(0, 0, 8, 0);
+            proxyIcon.VerticalAlignment = VerticalAlignment.Center;
+            proxyLeft.Children.Add(proxyIcon);
+            proxyLeft.Children.Add(new TextBlock
+            {
+                Text = "代理进程",
+                FontFamily = UiFont,
+                FontSize = 11.5,
+                FontWeight = FontWeights.Medium,
+                VerticalAlignment = VerticalAlignment.Center
+            });
+            proxyTop.Children.Add(proxyLeft);
+            proxyStack.Children.Add(proxyTop);
+
+            _txtProxyProcesses = new TextBox
+            {
+                FontFamily = MonoFont,
+                FontSize = 10.5,
+                Padding = new Thickness(6, 4, 6, 4),
+                BorderThickness = new Thickness(0),
+                Background = Brushes.Transparent,
+                ToolTip = "逗号分隔代理进程名（无需 .exe），失焦或回车生效",
+                Tag = "ConfigInput"
+            };
+            _txtProxyProcesses.KeyDown += (s, e) =>
+            {
+                if (e.Key == Key.Enter)
+                {
+                    CommitProxyProcessNames();
+                    Keyboard.ClearFocus();
+                    e.Handled = true;
+                }
+            };
+            _txtProxyProcesses.LostFocus += (s, e) => CommitProxyProcessNames();
+            var proxyInputShell = new Border
+            {
+                CornerRadius = new CornerRadius(6),
+                BorderThickness = new Thickness(1),
+                SnapsToDevicePixels = true,
+                Tag = "InputShell",
+                Child = _txtProxyProcesses
+            };
+            proxyStack.Children.Add(proxyInputShell);
+            proxyRow.Child = proxyStack;
+
+            // Data reset actions row
+            var dataBtnPanel = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            _btnCfgResetToday = MakeGhostIconButton(IconFactory.ResetSvg, "重置今日", () =>
+            {
+                if (!_confirmCfgResetToday)
+                {
+                    ClearPendingConfirmStates();
+                    _confirmCfgResetToday = true;
+                    SetGhostButtonLabel(_btnCfgResetToday, "确认重置?");
+                    RestartConfirmResetTimer();
+                    return;
+                }
+                ClearPendingConfirmStates();
+                if (ResetTodayTrafficRequested != null) ResetTodayTrafficRequested();
+            });
+            _btnCfgResetToday.Margin = new Thickness(0, 0, 6, 0);
+
+            _btnCfgClearAll = MakeGhostIconButton(IconFactory.TrashSvg, "清空全部", () =>
+            {
+                if (!_confirmCfgClearAll)
+                {
+                    ClearPendingConfirmStates();
+                    _confirmCfgClearAll = true;
+                    SetGhostButtonLabel(_btnCfgClearAll, "确认清空?");
+                    RestartConfirmResetTimer();
+                    return;
+                }
+                ClearPendingConfirmStates();
+                if (ClearAllTrafficRequested != null) ClearAllTrafficRequested();
+            });
+            dataBtnPanel.Children.Add(_btnCfgResetToday);
+            dataBtnPanel.Children.Add(_btnCfgClearAll);
+            var trafficDataRow = MakeRowShell(IconFactory.TrashSvg, "统计记录", dataBtnPanel);
+
+            _settingsView.Children.Add(MakeGroupCard(resetDayRow, proxyRow, trafficDataRow));
+
+            // ── Footer: Minimal Keycap Hints ──
+            var hkFooter = new DockPanel { Margin = new Thickness(3, 1, 3, 0) };
+            var hkRight = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            DockPanel.SetDock(hkRight, Dock.Right);
+            hkRight.Children.Add(MakeKeycapPair("Ctrl+Alt+L", "穿透"));
+            hkRight.Children.Add(new Border { Width = 10 });
+            hkRight.Children.Add(MakeKeycapPair("Ctrl+Alt+M", "面板"));
+            hkFooter.Children.Add(hkRight);
+
+            var hkTitle = new TextBlock
+            {
+                Text = "HOTKEYS",
+                FontFamily = MonoFont,
+                FontSize = 9.5,
+                Tag = "Muted",
+                Opacity = 0.7,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            hkFooter.Children.Add(hkTitle);
+            _settingsView.Children.Add(hkFooter);
         }
 
         private bool _suppressSwitchEvents;
@@ -598,16 +1786,63 @@ namespace SysTelemetry.UI
                 _sliderOpacity.Value = Math.Round(_config.DesktopOpacity * 100.0);
                 _lblOpacity.Text = string.Format("{0:0}%", _sliderOpacity.Value);
                 _sliderOffset.Value = _config.TaskbarOffsetX;
-                _lblOffset.Text = string.Format("{0:+0;-0;0}px", _config.TaskbarOffsetX);
 
                 var pal = ThemeHelper.GetPalette(_config.Theme);
+                UpdateOffsetReadout();
+                UpdateOverlayRowState();
+                if (_lblTrafficResetDay != null)
+                    _lblTrafficResetDay.Text = string.Format("每月 {0} 日", _config.TrafficResetDay);
+                if (_txtProxyProcesses != null && !_txtProxyProcesses.IsKeyboardFocusWithin)
+                    _txtProxyProcesses.Text = _config.ProxyProcessNames ?? AppConfig.DefaultProxyProcessNames;
                 HighlightSelected(_skinButtons, _config.Skin, pal);
                 HighlightSelected(_themeButtons, _config.Theme, pal);
                 HighlightSelected(_rateButtons, _config.PollIntervalMs, pal);
                 HighlightSelected(_tempButtons, _config.TempWarnThreshold, pal);
                 HighlightSelected(_dockButtons, _config.TaskbarDock, pal);
+                HighlightSelected(_trafficHistoryButtons, _trafficMonthlyMode, pal);
             }
             finally { _suppressSwitchEvents = false; }
+        }
+
+        private void AdjustTrafficResetDay(int delta)
+        {
+            int next = _config.TrafficResetDay + delta;
+            if (next < 1) next = 31;
+            else if (next > 31) next = 1;
+            _config.TrafficResetDay = next;
+            _config.Save();
+            if (_lblTrafficResetDay != null)
+                _lblTrafficResetDay.Text = string.Format("每月 {0} 日", _config.TrafficResetDay);
+            if (TrafficConfigChanged != null) TrafficConfigChanged();
+        }
+
+        private void CommitProxyProcessNames()
+        {
+            if (_txtProxyProcesses == null || _suppressSwitchEvents) return;
+            string cleaned = (_txtProxyProcesses.Text ?? string.Empty).Trim();
+            if (string.Equals(cleaned, _config.ProxyProcessNames, StringComparison.Ordinal)) return;
+            _config.ProxyProcessNames = cleaned;
+            _config.Save();
+            if (TrafficConfigChanged != null) TrafficConfigChanged();
+        }
+
+        private void UpdateOffsetReadout()
+        {
+            if (_lblOffset == null || _offsetBadge == null) return;
+            _lblOffset.Text = _config.TaskbarOffsetX == 0
+                ? "0px"
+                : string.Format("{0:+0;-0;0}px", _config.TaskbarOffsetX);
+            bool active = _config.TaskbarOffsetX != 0;
+            _lblOffset.Foreground = active ? _accentPrimaryBrush : _mutedTextBrush;
+            _offsetBadge.Cursor = active ? Cursors.Hand : Cursors.Arrow;
+        }
+
+        private void UpdateOverlayRowState()
+        {
+            double stateOpacity = _config.DesktopOverlayEnabled ? 1.0 : 0.45;
+            if (_deskLockRow != null) _deskLockRow.Opacity = stateOpacity;
+            if (_deskOpacityRow != null) _deskOpacityRow.Opacity = stateOpacity;
+            if (_btnResetCorner != null) _btnResetCorner.Opacity = stateOpacity;
         }
 
         private void OnAutoStartToggled(bool enable)
@@ -624,6 +1859,7 @@ namespace SysTelemetry.UI
             _config.Save();
             if (DesktopOverlayToggled != null) DesktopOverlayToggled();
             ApplyThemeColors();
+            UpdateOverlayRowState();
         }
 
         private void OnDeskLockToggled(bool locked)
@@ -636,13 +1872,33 @@ namespace SysTelemetry.UI
 
         public void SetSettingsMode(bool open)
         {
-            _settingsOpen = open;
-            _telemetryView.Visibility = open ? Visibility.Collapsed : Visibility.Visible;
-            _settingsScroll.Visibility = open ? Visibility.Visible : Visibility.Collapsed;
-            _titleText.Text = open ? "SYS.CONFIG" : "SYS.TELEMETRY";
+            SetViewMode(open ? PopoverViewMode.Settings : PopoverViewMode.Telemetry);
+        }
+
+        public void SetViewMode(PopoverViewMode mode)
+        {
+            if (_activeView == PopoverViewMode.Settings && mode != PopoverViewMode.Settings)
+                CommitProxyProcessNames();
+
+            ClearPendingConfirmStates();
+            _activeView = mode;
+            _telemetryView.Visibility = mode == PopoverViewMode.Telemetry ? Visibility.Visible : Visibility.Collapsed;
+            _trafficScroll.Visibility = mode == PopoverViewMode.Traffic ? Visibility.Visible : Visibility.Collapsed;
+            _settingsScroll.Visibility = mode == PopoverViewMode.Settings ? Visibility.Visible : Visibility.Collapsed;
+
+            if (mode == PopoverViewMode.Settings) _titleText.Text = "SYS.CONFIG";
+            else if (mode == PopoverViewMode.Traffic) _titleText.Text = "SYS.TRAFFIC";
+            else _titleText.Text = "SYS.TELEMETRY";
+
+            if (_btnTraffic != null)
+                _btnTraffic.ToolTip = mode == PopoverViewMode.Traffic ? "返回监控视图" : "流量统计 (SYS.TRAFFIC)";
+            if (_btnGear != null)
+                _btnGear.ToolTip = mode == PopoverViewMode.Settings ? "返回监控视图" : "设置 (SYS.CONFIG)";
+
             ApplyThemeColors();
-            if (open) SyncSettingsControls();
+            if (mode == PopoverViewMode.Settings) SyncSettingsControls();
             else if (_lastSnap != null) UpdateMetrics(_lastSnap);
+
             if (IsVisible)
             {
                 UpdateLayout();
@@ -653,6 +1909,10 @@ namespace SysTelemetry.UI
         public void ApplyThemeColors()
         {
             var pal = ThemeHelper.GetPalette(_config.Theme);
+            _rowHoverBrush = pal.RowHoverBackground;
+            _accentPrimaryBrush = pal.AccentPrimary;
+            _mutedTextBrush = pal.TaskbarTextMuted;
+
             _shellBorder.Background = pal.PopoverBackground;
             _shellBorder.BorderBrush = pal.PopoverBorder;
             _statusDot.Fill = pal.StatusOk;
@@ -664,11 +1924,29 @@ namespace SysTelemetry.UI
 
             StyleHeaderButton(_btnDesktopToggle, pal, _config.DesktopOverlayEnabled);
             StyleHeaderButton(_btnTrim, pal, false);
-            StyleHeaderButton(_btnGear, pal, _settingsOpen);
+            StyleHeaderButton(_btnTraffic, pal, _activeView == PopoverViewMode.Traffic);
+            StyleHeaderButton(_btnGear, pal, _activeView == PopoverViewMode.Settings);
             StyleHeaderButton(_btnClose, pal, false, borderless: true);
 
             ApplyPaletteToTree(_telemetryView, pal);
+            ApplyPaletteToTree(_trafficView, pal);
             ApplyPaletteToTree(_settingsView, pal);
+
+            HighlightSelected(_skinButtons, _config.Skin, pal);
+            HighlightSelected(_themeButtons, _config.Theme, pal);
+            HighlightSelected(_rateButtons, _config.PollIntervalMs, pal);
+            HighlightSelected(_tempButtons, _config.TempWarnThreshold, pal);
+            HighlightSelected(_dockButtons, _config.TaskbarDock, pal);
+            HighlightSelected(_trafficHistoryButtons, _trafficMonthlyMode, pal);
+            UpdateOffsetReadout();
+
+            if (_lastSnap != null)
+            {
+                if (_activeView == PopoverViewMode.Telemetry)
+                    UpdateNetSummaryStrip(_lastSnap, pal);
+                else if (_activeView == PopoverViewMode.Traffic)
+                    UpdateTrafficView(_lastSnap, pal);
+            }
         }
 
         public void PlayTrimAnimation()
@@ -757,11 +2035,11 @@ namespace SysTelemetry.UI
 
         private static void StyleHeaderButton(Border btn, ThemePalette pal, bool active, bool borderless = false)
         {
-            btn.Background = active ? ThemeHelper.BrushFromHex("#2438BDF8") : (borderless ? Brushes.Transparent : pal.SubSurfaceBackground);
-            btn.BorderBrush = active ? pal.AccentBlue : (borderless ? Brushes.Transparent : pal.SubSurfaceBorder);
+            btn.Background = active ? pal.HeaderActiveBackground : (borderless ? Brushes.Transparent : pal.SubSurfaceBackground);
+            btn.BorderBrush = active ? pal.AccentPrimary : (borderless ? Brushes.Transparent : pal.SubSurfaceBorder);
             var path = btn.Child as Path;
             if (path != null)
-                path.Stroke = active ? pal.AccentBlue : pal.TaskbarTextPrimary;
+                path.Stroke = active ? pal.AccentPrimary : pal.TaskbarTextPrimary;
         }
 
         private static void ApplyPaletteToTree(DependencyObject root, ThemePalette pal)
@@ -773,13 +2051,46 @@ namespace SysTelemetry.UI
                 var child = VisualTreeHelper.GetChild(root, i);
                 var b = child as Border;
                 var tb = child as TextBlock;
+                var path = child as Path;
                 var button = child as Button;
+                var slider = child as Slider;
+                var chk = child as CheckBox;
+                var txt = child as TextBox;
+                var ell = child as Ellipse;
                 if (b != null)
                 {
                     if (Equals(b.Tag, "SubCard"))
                     {
                         b.Background = pal.SubSurfaceBackground;
                         b.BorderBrush = pal.SubSurfaceBorder;
+                    }
+                    else if (Equals(b.Tag, "GroupCard"))
+                    {
+                        b.Background = pal.GroupCardBackground;
+                        b.BorderBrush = pal.GroupCardBorder;
+                    }
+                    else if (Equals(b.Tag, "Hairline"))
+                    {
+                        b.Background = pal.HairlineBrush;
+                    }
+                    else if (Equals(b.Tag, "SegTrack"))
+                    {
+                        b.Background = pal.SegmentedTrackBackground;
+                        b.BorderBrush = pal.SegmentedTrackBorder;
+                    }
+                    else if (Equals(b.Tag, "Keycap"))
+                    {
+                        b.Background = pal.KeycapBackground;
+                        b.BorderBrush = pal.KeycapBorder;
+                    }
+                    else if (Equals(b.Tag, "ProxyBadge"))
+                    {
+                        b.Background = pal.ProxyBadgeBackground;
+                    }
+                    else if (Equals(b.Tag, "InputShell"))
+                    {
+                        b.Background = pal.InputBackground;
+                        b.BorderBrush = pal.InputBorder;
                     }
                     else if (Equals(b.Tag, "Divider"))
                     {
@@ -788,15 +2099,74 @@ namespace SysTelemetry.UI
                 }
                 else if (tb != null)
                 {
-                    tb.Foreground = Equals(tb.Tag, "Muted") ? pal.TaskbarTextMuted : pal.TaskbarTextPrimary;
+                    if (Equals(tb.Tag, "PurpleText"))
+                        tb.Foreground = pal.AccentPurple;
+                    else if (Equals(tb.Tag, "AccentText"))
+                        tb.Foreground = pal.AccentPrimary;
+                    else if (!Equals(tb.Tag, "OffsetVal") && !Equals(tb.Tag, "PreserveColor"))
+                        tb.Foreground = Equals(tb.Tag, "Muted") ? pal.TaskbarTextMuted : pal.TaskbarTextPrimary;
                 }
-                else if (button != null && Equals(button.Tag, "MiniBtn"))
+                else if (ell != null && Equals(ell.Tag, "DirectDot"))
                 {
-                    button.Background = pal.SubSurfaceBackground;
-                    button.BorderBrush = pal.SubSurfaceBorder;
-                    button.Foreground = pal.TaskbarTextPrimary;
+                    ell.Fill = pal.DirectBarBrush;
+                }
+                else if (txt != null && Equals(txt.Tag, "ConfigInput"))
+                {
+                    txt.Background = Brushes.Transparent;
+                    txt.Foreground = pal.TaskbarTextPrimary;
+                    txt.CaretBrush = pal.AccentPrimary;
+                    continue;
+                }
+                else if (path != null && Equals(path.Tag, "RowIcon"))
+                {
+                    path.Stroke = pal.TaskbarTextMuted;
+                }
+                else if (button != null)
+                {
+                    if (Equals(button.Tag, "GhostBtn"))
+                    {
+                        button.Background = pal.SubSurfaceBackground;
+                        button.BorderBrush = pal.SubSurfaceBorder;
+                        button.Foreground = pal.TaskbarTextMuted;
+                        ApplyPaletteToLogicalSubtree(button.Content as DependencyObject, pal);
+                    }
+                    else if (Equals(button.Tag, "StepBtn"))
+                    {
+                        button.Foreground = pal.TaskbarTextPrimary;
+                    }
+                    continue;
+                }
+                else if (slider != null)
+                {
+                    slider.Background = pal.TrackBackground;
+                    slider.Foreground = pal.AccentPrimary;
+                    slider.BorderBrush = pal.TaskbarTextMuted;
+                    continue;
+                }
+                else if (chk != null)
+                {
+                    chk.Background = pal.SwitchOffBackground;
+                    chk.BorderBrush = pal.SwitchOnBackground;
+                    continue;
                 }
                 ApplyPaletteToTree(child, pal);
+            }
+        }
+
+        private static void ApplyPaletteToLogicalSubtree(DependencyObject node, ThemePalette pal)
+        {
+            if (node == null) return;
+            var tb = node as TextBlock;
+            var path = node as Path;
+            if (tb != null)
+                tb.Foreground = Equals(tb.Tag, "Muted") ? pal.TaskbarTextMuted : pal.TaskbarTextPrimary;
+            else if (path != null && Equals(path.Tag, "RowIcon"))
+                path.Stroke = pal.TaskbarTextMuted;
+
+            foreach (object child in LogicalTreeHelper.GetChildren(node))
+            {
+                var dep = child as DependencyObject;
+                if (dep != null) ApplyPaletteToLogicalSubtree(dep, pal);
             }
         }
 
@@ -846,7 +2216,7 @@ namespace SysTelemetry.UI
         {
             var sp = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
             sp.Children.Add(new Ellipse { Width = 6, Height = 6, Fill = ThemeHelper.BrushFromHex(hex), Margin = new Thickness(0, 0, 4, 0) });
-            sp.Children.Add(new TextBlock { Text = label, FontFamily = MonoFont, FontSize = 10, Foreground = ThemeHelper.BrushFromHex(hex) });
+            sp.Children.Add(new TextBlock { Text = label, FontFamily = MonoFont, FontSize = 10, Foreground = ThemeHelper.BrushFromHex(hex), Tag = "PreserveColor" });
             return sp;
         }
 
@@ -884,72 +2254,137 @@ namespace SysTelemetry.UI
             {
                 Text = text,
                 FontFamily = MonoFont,
-                FontSize = 10,
+                FontSize = 9.5,
+                FontWeight = FontWeights.SemiBold,
                 Tag = "Muted",
-                Margin = new Thickness(0, 4, 0, 4)
+                Opacity = 0.78,
+                Margin = new Thickness(3, 1, 0, 4)
             };
         }
 
-        private static Border MakeSettingRow(string title, string desc, UIElement rightControl)
+        private static Border MakeGroupCard(params Border[] rows)
+        {
+            var card = new Border
+            {
+                CornerRadius = new CornerRadius(10),
+                BorderThickness = new Thickness(1),
+                Margin = new Thickness(0, 0, 0, 8),
+                ClipToBounds = true,
+                SnapsToDevicePixels = true,
+                Tag = "GroupCard"
+            };
+            var stack = new StackPanel();
+            for (int i = 0; i < rows.Length; i++)
+            {
+                Border r = rows[i];
+                if (rows.Length == 1)
+                    r.CornerRadius = new CornerRadius(9);
+                else if (i == 0)
+                    r.CornerRadius = new CornerRadius(9, 9, 0, 0);
+                else if (i == rows.Length - 1)
+                    r.CornerRadius = new CornerRadius(0, 0, 9, 9);
+                else
+                    r.CornerRadius = new CornerRadius(0);
+
+                stack.Children.Add(r);
+                if (i < rows.Length - 1)
+                {
+                    stack.Children.Add(new Border
+                    {
+                        Height = 1,
+                        Margin = new Thickness(33, 0, 10, 0),
+                        SnapsToDevicePixels = true,
+                        Tag = "Hairline"
+                    });
+                }
+            }
+            card.Child = stack;
+            return card;
+        }
+
+        private Border MakeRowShell(string svgPath, string title, UIElement rightControl)
         {
             var row = new Border
             {
-                CornerRadius = new CornerRadius(8),
-                BorderThickness = new Thickness(1),
-                Padding = new Thickness(9, 6, 9, 6),
-                Margin = new Thickness(0, 0, 0, 5),
-                Tag = "SubCard"
+                Background = Brushes.Transparent,
+                Padding = new Thickness(10, 5, 10, 5),
+                MinHeight = 32,
+                SnapsToDevicePixels = true
             };
+            row.MouseEnter += (s, e) => { row.Background = _rowHoverBrush; };
+            row.MouseLeave += (s, e) => { row.Background = Brushes.Transparent; };
+
             var dp = new DockPanel();
+            var feRight = rightControl as FrameworkElement;
+            if (feRight != null) feRight.VerticalAlignment = VerticalAlignment.Center;
             DockPanel.SetDock(rightControl, Dock.Right);
-            var fe = rightControl as FrameworkElement;
-            if (fe != null) fe.VerticalAlignment = VerticalAlignment.Center;
             dp.Children.Add(rightControl);
 
-            var left = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
-            left.Children.Add(new TextBlock { Text = title, FontFamily = UiFont, FontSize = 11.5, FontWeight = FontWeights.SemiBold });
-            left.Children.Add(new TextBlock { Text = desc, FontFamily = UiFont, FontSize = 10, Tag = "Muted" });
+            var left = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            var icon = IconFactory.CreateVectorIcon(svgPath, 13, Brushes.Gray, 1.6);
+            icon.Tag = "RowIcon";
+            icon.Opacity = 0.85;
+            icon.Margin = new Thickness(0, 0, 8, 0);
+            icon.VerticalAlignment = VerticalAlignment.Center;
+            left.Children.Add(icon);
+            left.Children.Add(new TextBlock
+            {
+                Text = title,
+                FontFamily = UiFont,
+                FontSize = 11.5,
+                FontWeight = FontWeights.Medium,
+                VerticalAlignment = VerticalAlignment.Center
+            });
             dp.Children.Add(left);
+
             row.Child = dp;
             return row;
         }
 
-        private static Border MakeSliderRow(string title, TextBlock readout, Slider slider)
+        private Border MakeToggleRow(string svgPath, string title, UIElement rightControl, CheckBox targetSwitch)
         {
-            var row = new Border
+            var row = MakeRowShell(svgPath, title, rightControl);
+            row.Cursor = Cursors.Hand;
+            row.MouseLeftButtonUp += (s, e) =>
             {
-                CornerRadius = new CornerRadius(8),
-                BorderThickness = new Thickness(1),
-                Padding = new Thickness(9, 6, 9, 6),
-                Margin = new Thickness(0, 0, 0, 5),
-                Tag = "SubCard"
+                if (e.Handled || IsInsideButtonBase(e.OriginalSource as DependencyObject)) return;
+                targetSwitch.IsChecked = !(targetSwitch.IsChecked == true);
+                e.Handled = true;
             };
-            var dp = new DockPanel();
+            return row;
+        }
+
+        private static bool IsInsideButtonBase(DependencyObject dep)
+        {
+            while (dep != null)
+            {
+                if (dep is ButtonBase) return true;
+                dep = VisualTreeHelper.GetParent(dep);
+            }
+            return false;
+        }
+
+        private Border MakeSliderRow(string svgPath, string title, Slider slider, UIElement readoutElement)
+        {
+            var right = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
             slider.VerticalAlignment = VerticalAlignment.Center;
-            DockPanel.SetDock(slider, Dock.Right);
-            dp.Children.Add(slider);
-
-            var left = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
-            left.Children.Add(new TextBlock { Text = title, FontFamily = UiFont, FontSize = 11.5, FontWeight = FontWeights.SemiBold });
-            left.Children.Add(readout);
-            dp.Children.Add(left);
-            row.Child = dp;
-            return row;
+            right.Children.Add(slider);
+            right.Children.Add(readoutElement);
+            return MakeRowShell(svgPath, title, right);
         }
 
-        private static Border MakeOptionGroupRow(string title, Tuple<string, object>[] options, List<Button> bucket, Action<object> onSelect)
+        private Border MakeSegmentedRow(string svgPath, string title, Tuple<string, object>[] options, List<Button> bucket, bool useMonoFont, Action<object> onSelect)
         {
-            var row = new Border
+            var track = new Border
             {
-                CornerRadius = new CornerRadius(8),
+                CornerRadius = new CornerRadius(7),
                 BorderThickness = new Thickness(1),
-                Padding = new Thickness(9, 6, 9, 6),
-                Margin = new Thickness(0, 0, 0, 5),
-                Tag = "SubCard"
+                Padding = new Thickness(2),
+                VerticalAlignment = VerticalAlignment.Center,
+                Tag = "SegTrack"
             };
-            var dp = new DockPanel();
-            var pillGroup = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
-            DockPanel.SetDock(pillGroup, Dock.Right);
+            var segPanel = new StackPanel { Orientation = Orientation.Horizontal };
+            var btnTemplate = MakeSegmentButtonTemplate();
 
             foreach (var opt in options)
             {
@@ -957,42 +2392,194 @@ namespace SysTelemetry.UI
                 {
                     Content = opt.Item1,
                     Tag = opt.Item2,
-                    FontFamily = UiFont,
+                    FontFamily = useMonoFont ? MonoFont : UiFont,
                     FontSize = 10.5,
-                    Padding = new Thickness(7, 2, 7, 2),
-                    Margin = new Thickness(3, 0, 0, 0),
+                    Padding = new Thickness(8, 2.5, 8, 2.5),
                     Cursor = Cursors.Hand,
+                    Focusable = false,
                     BorderThickness = new Thickness(1),
-                    Template = MakeFlatButtonTemplate(new CornerRadius(5))
+                    Template = btnTemplate
                 };
                 object captured = opt.Item2;
                 btn.Click += (s, e) => onSelect(captured);
                 bucket.Add(btn);
-                pillGroup.Children.Add(btn);
+                segPanel.Children.Add(btn);
             }
 
-            dp.Children.Add(pillGroup);
-            dp.Children.Add(new TextBlock { Text = title, FontFamily = UiFont, FontSize = 11.5, FontWeight = FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center });
-            row.Child = dp;
-            return row;
+            track.Child = segPanel;
+            return MakeRowShell(svgPath, title, track);
         }
 
-        private static ControlTemplate MakeFlatButtonTemplate(CornerRadius radius)
+        private static Button MakeGhostIconButton(string svgPath, string text, Action onClick)
         {
-            var template = new ControlTemplate(typeof(Button));
-            var border = new FrameworkElementFactory(typeof(Border));
-            border.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(Control.BackgroundProperty));
-            border.SetValue(Border.BorderBrushProperty, new TemplateBindingExtension(Control.BorderBrushProperty));
-            border.SetValue(Border.BorderThicknessProperty, new TemplateBindingExtension(Control.BorderThicknessProperty));
-            border.SetValue(Border.CornerRadiusProperty, radius);
-            border.SetValue(Border.PaddingProperty, new TemplateBindingExtension(Control.PaddingProperty));
+            var sp = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            var icon = IconFactory.CreateVectorIcon(svgPath, 10.5, Brushes.Gray, 1.7);
+            icon.Tag = "RowIcon";
+            icon.Margin = new Thickness(0, 0, 4, 0);
+            icon.VerticalAlignment = VerticalAlignment.Center;
+            sp.Children.Add(icon);
+            sp.Children.Add(new TextBlock
+            {
+                Text = text,
+                FontFamily = UiFont,
+                FontSize = 10,
+                Tag = "Muted",
+                VerticalAlignment = VerticalAlignment.Center
+            });
 
-            var cp = new FrameworkElementFactory(typeof(ContentPresenter));
-            cp.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Center);
-            cp.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
-            border.AppendChild(cp);
-            template.VisualTree = border;
-            return template;
+            var btn = new Button
+            {
+                Content = sp,
+                Padding = new Thickness(6, 2.5, 6, 2.5),
+                Cursor = Cursors.Hand,
+                Focusable = false,
+                BorderThickness = new Thickness(1),
+                Template = MakeSegmentButtonTemplate(),
+                Tag = "GhostBtn"
+            };
+            btn.Click += (s, e) => { e.Handled = true; onClick(); };
+            return btn;
+        }
+
+        private static StackPanel MakeKeycapPair(string keyText, string labelText)
+        {
+            var sp = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            var kbd = new Border
+            {
+                CornerRadius = new CornerRadius(4),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(5, 1.5, 5, 1.5),
+                Margin = new Thickness(0, 0, 4, 0),
+                Tag = "Keycap",
+                Child = new TextBlock
+                {
+                    Text = keyText,
+                    FontFamily = MonoFont,
+                    FontSize = 9.5,
+                    Tag = "Muted"
+                }
+            };
+            sp.Children.Add(kbd);
+            sp.Children.Add(new TextBlock
+            {
+                Text = labelText,
+                FontFamily = UiFont,
+                FontSize = 10,
+                Tag = "Muted",
+                Opacity = 0.8,
+                VerticalAlignment = VerticalAlignment.Center
+            });
+            return sp;
+        }
+
+        private static ControlTemplate MakeSegmentButtonTemplate()
+        {
+            const string xaml = @"
+<ControlTemplate xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'
+                 xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
+                 TargetType='{x:Type Button}'>
+  <Border Background='{TemplateBinding Background}'
+          BorderBrush='{TemplateBinding BorderBrush}'
+          BorderThickness='{TemplateBinding BorderThickness}'
+          CornerRadius='5'
+          SnapsToDevicePixels='True'>
+    <Grid>
+      <Border x:Name='HoverVeil' CornerRadius='4' Background='Transparent'/>
+      <ContentPresenter Margin='{TemplateBinding Padding}'
+                        HorizontalAlignment='Center'
+                        VerticalAlignment='Center'/>
+    </Grid>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property='IsMouseOver' Value='True'>
+      <Setter TargetName='HoverVeil' Property='Background' Value='#14808080'/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>";
+            return (ControlTemplate)XamlReader.Parse(xaml);
+        }
+
+        private static Slider MakeMinimalSlider(double min, double max, double tick, double width, bool showFillBar, bool showCenterTick)
+        {
+            string centerTickXaml = showCenterTick
+                ? "<Border Width='2' Height='8' CornerRadius='1' HorizontalAlignment='Center' VerticalAlignment='Center' Opacity='0.5' Background='{TemplateBinding BorderBrush}'/>"
+                : "";
+            string decreaseXaml = showFillBar
+                ? @"<ControlTemplate TargetType='{x:Type RepeatButton}'>
+                      <Grid Height='18' Background='Transparent'>
+                        <Border Height='3' CornerRadius='1.5' VerticalAlignment='Center'
+                                Background='{Binding Foreground, RelativeSource={RelativeSource AncestorType={x:Type Slider}}}'/>
+                      </Grid>
+                    </ControlTemplate>"
+                : @"<ControlTemplate TargetType='{x:Type RepeatButton}'>
+                      <Border Height='18' Background='Transparent'/>
+                    </ControlTemplate>";
+
+            string xaml = string.Format(@"
+<ControlTemplate xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'
+                 xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
+                 TargetType='{{x:Type Slider}}'>
+  <Grid Height='18' Background='Transparent' VerticalAlignment='Center' SnapsToDevicePixels='True'>
+    <Border Height='3' CornerRadius='1.5' VerticalAlignment='Center' Background='{{TemplateBinding Background}}'/>
+    {0}
+    <Track x:Name='PART_Track' VerticalAlignment='Center'>
+      <Track.DecreaseRepeatButton>
+        <RepeatButton Command='{{x:Static Slider.DecreaseLarge}}' Focusable='False' Cursor='Hand'>
+          <RepeatButton.Template>{1}</RepeatButton.Template>
+        </RepeatButton>
+      </Track.DecreaseRepeatButton>
+      <Track.IncreaseRepeatButton>
+        <RepeatButton Command='{{x:Static Slider.IncreaseLarge}}' Focusable='False' Cursor='Hand'>
+          <RepeatButton.Template>
+            <ControlTemplate TargetType='{{x:Type RepeatButton}}'>
+              <Border Height='18' Background='Transparent'/>
+            </ControlTemplate>
+          </RepeatButton.Template>
+        </RepeatButton>
+      </Track.IncreaseRepeatButton>
+      <Track.Thumb>
+        <Thumb x:Name='Thumb' Width='13' Height='13' Cursor='Hand' Focusable='False'>
+          <Thumb.Template>
+            <ControlTemplate TargetType='{{x:Type Thumb}}'>
+              <Grid Background='Transparent'>
+                <Border x:Name='Cap' Width='11' Height='11' CornerRadius='5.5'
+                        Background='#FFFFFFFF' BorderThickness='1.5'
+                        BorderBrush='{{Binding Foreground, RelativeSource={{RelativeSource AncestorType={{x:Type Slider}}}}}}'
+                        HorizontalAlignment='Center' VerticalAlignment='Center'/>
+              </Grid>
+              <ControlTemplate.Triggers>
+                <Trigger Property='IsMouseOver' Value='True'>
+                  <Setter TargetName='Cap' Property='Width' Value='12.5'/>
+                  <Setter TargetName='Cap' Property='Height' Value='12.5'/>
+                  <Setter TargetName='Cap' Property='CornerRadius' Value='6.25'/>
+                </Trigger>
+                <Trigger Property='IsDragging' Value='True'>
+                  <Setter TargetName='Cap' Property='Width' Value='13'/>
+                  <Setter TargetName='Cap' Property='Height' Value='13'/>
+                  <Setter TargetName='Cap' Property='CornerRadius' Value='6.5'/>
+                  <Setter TargetName='Cap' Property='BorderThickness' Value='2'/>
+                </Trigger>
+              </ControlTemplate.Triggers>
+            </ControlTemplate>
+          </Thumb.Template>
+        </Thumb>
+      </Track.Thumb>
+    </Track>
+  </Grid>
+</ControlTemplate>", centerTickXaml, decreaseXaml);
+
+            return new Slider
+            {
+                Width = width,
+                Minimum = min,
+                Maximum = max,
+                IsSnapToTickEnabled = true,
+                TickFrequency = tick,
+                IsMoveToPointEnabled = true,
+                Focusable = false,
+                Cursor = Cursors.Hand,
+                Template = (ControlTemplate)XamlReader.Parse(xaml)
+            };
         }
 
         private static void HighlightSelected(List<Button> buttons, object activeVal, ThemePalette pal)
@@ -1000,38 +2587,84 @@ namespace SysTelemetry.UI
             foreach (var b in buttons)
             {
                 bool active = Equals(b.Tag, activeVal);
-                b.Background = active ? ThemeHelper.BrushFromHex("#2563EB") : pal.SubSurfaceBackground;
-                b.BorderBrush = active ? ThemeHelper.BrushFromHex("#3B82F6") : pal.SubSurfaceBorder;
-                b.Foreground = active ? Brushes.White : pal.TaskbarTextMuted;
+                b.Background = active ? pal.SegmentedPillBackground : Brushes.Transparent;
+                b.BorderBrush = active ? pal.SegmentedPillBorder : Brushes.Transparent;
+                b.Foreground = active ? pal.TaskbarTextPrimary : pal.SegmentedInactiveText;
+                b.FontWeight = active ? FontWeights.SemiBold : FontWeights.Normal;
             }
+        }
+
+        private static void ApplyThinScrollBarStyle(ScrollViewer sv)
+        {
+            const string xaml = @"
+<Style xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'
+       xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
+       TargetType='{x:Type ScrollBar}'>
+  <Setter Property='Width' Value='5'/>
+  <Setter Property='MinWidth' Value='5'/>
+  <Setter Property='Background' Value='Transparent'/>
+  <Setter Property='Template'>
+    <Setter.Value>
+      <ControlTemplate TargetType='{x:Type ScrollBar}'>
+        <Grid Background='Transparent' Width='5'>
+          <Track x:Name='PART_Track' IsDirectionReversed='True'>
+            <Track.DecreaseRepeatButton>
+              <RepeatButton Command='ScrollBar.PageUpCommand' Opacity='0' Focusable='False'/>
+            </Track.DecreaseRepeatButton>
+            <Track.IncreaseRepeatButton>
+              <RepeatButton Command='ScrollBar.PageDownCommand' Opacity='0' Focusable='False'/>
+            </Track.IncreaseRepeatButton>
+            <Track.Thumb>
+              <Thumb>
+                <Thumb.Template>
+                  <ControlTemplate TargetType='{x:Type Thumb}'>
+                    <Border x:Name='ThumbBar' Background='#4894A3B8' CornerRadius='2.5' Margin='1,2,0,2'/>
+                    <ControlTemplate.Triggers>
+                      <Trigger Property='IsMouseOver' Value='True'>
+                        <Setter TargetName='ThumbBar' Property='Background' Value='#8894A3B8'/>
+                      </Trigger>
+                    </ControlTemplate.Triggers>
+                  </ControlTemplate>
+                </Thumb.Template>
+              </Thumb>
+            </Track.Thumb>
+          </Track>
+        </Grid>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>";
+            sv.Resources[typeof(ScrollBar)] = (Style)XamlReader.Parse(xaml);
         }
 
         private static CheckBox MakeSwitch()
         {
-            var template = new ControlTemplate(typeof(CheckBox));
-            var track = new FrameworkElementFactory(typeof(Border), "Track");
-            track.SetValue(Border.WidthProperty, 34.0);
-            track.SetValue(Border.HeightProperty, 18.0);
-            track.SetValue(Border.CornerRadiusProperty, new CornerRadius(9));
-            track.SetValue(Border.BackgroundProperty, ThemeHelper.BrushFromHex("#4494A3B8"));
-
-            var thumb = new FrameworkElementFactory(typeof(Border), "Thumb");
-            thumb.SetValue(Border.WidthProperty, 12.0);
-            thumb.SetValue(Border.HeightProperty, 12.0);
-            thumb.SetValue(Border.CornerRadiusProperty, new CornerRadius(6));
-            thumb.SetValue(Border.BackgroundProperty, Brushes.White);
-            thumb.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Left);
-            thumb.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
-            thumb.SetValue(FrameworkElement.MarginProperty, new Thickness(3, 0, 3, 0));
-            track.AppendChild(thumb);
-            template.VisualTree = track;
-
-            var checkedTrigger = new Trigger { Property = ToggleButton.IsCheckedProperty, Value = true };
-            checkedTrigger.Setters.Add(new Setter(Border.BackgroundProperty, ThemeHelper.BrushFromHex("#3B82F6"), "Track"));
-            checkedTrigger.Setters.Add(new Setter(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Right, "Thumb"));
-            template.Triggers.Add(checkedTrigger);
-
-            return new CheckBox { Template = template, Cursor = Cursors.Hand };
+            const string xaml = @"
+<ControlTemplate xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'
+                 xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'
+                 TargetType='{x:Type CheckBox}'>
+  <Border x:Name='Track' Width='30' Height='16' CornerRadius='8'
+          Background='{TemplateBinding Background}' SnapsToDevicePixels='True'>
+    <Border x:Name='Thumb' Width='12' Height='12' CornerRadius='6' Background='#FFFFFFFF'
+            HorizontalAlignment='Left' VerticalAlignment='Center' Margin='2,0,2,0'/>
+  </Border>
+  <ControlTemplate.Triggers>
+    <Trigger Property='IsChecked' Value='True'>
+      <Setter TargetName='Track' Property='Background'
+              Value='{Binding BorderBrush, RelativeSource={RelativeSource TemplatedParent}}'/>
+      <Setter TargetName='Thumb' Property='HorizontalAlignment' Value='Right'/>
+    </Trigger>
+    <Trigger Property='IsMouseOver' Value='True'>
+      <Setter TargetName='Track' Property='Opacity' Value='0.88'/>
+    </Trigger>
+  </ControlTemplate.Triggers>
+</ControlTemplate>";
+            return new CheckBox
+            {
+                Template = (ControlTemplate)XamlReader.Parse(xaml),
+                Cursor = Cursors.Hand,
+                Focusable = false
+            };
         }
     }
 }

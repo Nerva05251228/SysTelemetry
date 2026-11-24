@@ -38,10 +38,12 @@ $g.Dispose(); $bmp.Dispose(); $bg.Dispose(); $pen.Dispose()
 $sources = @(
     (Join-Path $root 'App.cs'),
     (Join-Path $root 'Models\AppConfig.cs'),
+    (Join-Path $root 'Models\TrafficStats.cs'),
     (Join-Path $root 'Models\TelemetrySnapshot.cs'),
     (Join-Path $root 'Interop\NativeMethods.cs'),
     (Join-Path $root 'Services\ThemeHelper.cs'),
     (Join-Path $root 'Services\AutoStartService.cs'),
+    (Join-Path $root 'Services\TrafficMonitorService.cs'),
     (Join-Path $root 'Services\TelemetryService.cs'),
     (Join-Path $root 'UI\IconFactory.cs'),
     (Join-Path $root 'UI\WidgetVisualBuilder.cs'),
