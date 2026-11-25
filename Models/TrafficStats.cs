@@ -5,6 +5,16 @@ using System.Runtime.Serialization;
 namespace SysTelemetry.Models
 {
     [DataContract]
+    public sealed class ApplicationTraffic
+    {
+        [DataMember] public long Received { get; set; }
+        [DataMember] public long Sent { get; set; }
+        [DataMember(EmitDefaultValue = false)] public long? LocalProxyBytes { get; set; }
+
+        public long Total { get { return Received + Sent; } }
+    }
+
+    [DataContract]
     public sealed class DailyTrafficRecord
     {
         [DataMember] public string Date { get; set; }
@@ -12,6 +22,7 @@ namespace SysTelemetry.Models
         [DataMember] public long GlobalTx { get; set; }
         [DataMember] public long ProxyRx { get; set; }
         [DataMember] public long ProxyTx { get; set; }
+        [DataMember(EmitDefaultValue = false)] public Dictionary<string, ApplicationTraffic> Applications { get; set; }
 
         public long GlobalTotal { get { return GlobalRx + GlobalTx; } }
         public long ProxyTotal { get { return ProxyRx + ProxyTx; } }

@@ -79,7 +79,7 @@ namespace SysTelemetry
 
             _taskbarBar = new TaskbarBarWindow(_config);
             _desktopOverlay = new DesktopOverlayWindow(_config);
-            _popover = new TelemetryPopoverWindow(_config);
+            _popover = new TelemetryPopoverWindow(_config, _trafficMonitor.GetApplicationTraffic);
 
             WireEvents();
             SetupTrayIcon();

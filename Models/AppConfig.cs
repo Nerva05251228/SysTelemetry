@@ -46,6 +46,7 @@ namespace SysTelemetry.Models
         [DataMember] public int TaskbarOffsetX { get; set; }
         [DataMember] public int TrafficResetDay { get; set; }
         [DataMember] public string ProxyProcessNames { get; set; }
+        [DataMember(EmitDefaultValue = false)] public string LocalProxyPorts { get; set; }
 
         public AppConfig()
         {

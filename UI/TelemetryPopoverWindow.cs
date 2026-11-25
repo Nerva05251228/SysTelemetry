@@ -31,6 +31,7 @@ namespace SysTelemetry.UI
         private static readonly FontFamily MonoFont = new FontFamily("Cascadia Mono, Consolas, Microsoft YaHei UI");
 
         private readonly AppConfig _config;
+        private readonly Func<bool, List<KeyValuePair<string, ApplicationTraffic>>> _getApplicationTraffic;
         private Border _shellBorder;
         private Ellipse _statusDot;
         private TextBlock _titleText;
@@ -80,6 +81,15 @@ namespace SysTelemetry.UI
         // Dedicated SYS.TRAFFIC view controls
         private bool _trafficMonthlyMode;
         private readonly List<Button> _trafficHistoryButtons = new List<Button>();
+        private readonly List<Button> _trafficViewButtons = new List<Button>();
+        private readonly List<Button> _applicationPeriodButtons = new List<Button>();
+        private bool _showApplicationTraffic;
+        private bool _applicationCycleMode;
+        private StackPanel _trafficOverview;
+        private StackPanel _applicationTrafficView;
+        private StackPanel _applicationRows;
+        private Border _applicationPeriodSelector;
+        private TextBlock _applicationEmpty;
         private TextBlock _tfTodaySectionTitle;
         private TextBlock _tfLiveSpeed;
         private TextBlock _tfTodayGlobalMain;
@@ -129,6 +139,7 @@ namespace SysTelemetry.UI
         private Border _deskOpacityRow;
         private TextBlock _lblTrafficResetDay;
         private TextBox _txtProxyProcesses;
+        private TextBox _txtLocalProxyPorts;
         private Button _btnCfgResetToday;
         private Button _btnCfgClearAll;
         private bool _confirmCfgResetToday;
@@ -160,9 +171,11 @@ namespace SysTelemetry.UI
         public event Action ResetTodayTrafficRequested;
         public event Action ClearAllTrafficRequested;
 
-        public TelemetryPopoverWindow(AppConfig config)
+        public TelemetryPopoverWindow(AppConfig config,
+            Func<bool, List<KeyValuePair<string, ApplicationTraffic>>> getApplicationTraffic)
         {
             _config = config;
+            _getApplicationTraffic = getApplicationTraffic;
             Width = 372;
             SizeToContent = SizeToContent.Height;
             AllowsTransparency = true;
@@ -183,6 +196,7 @@ namespace SysTelemetry.UI
             Deactivated += (s, e) =>
             {
                 CommitProxyProcessNames();
+                CommitLocalProxyPorts();
                 ClearPendingConfirmStates();
                 _lastDeactivatedUtc = DateTime.UtcNow;
                 Dispatcher.BeginInvoke(new Action(() =>
@@ -347,6 +361,17 @@ namespace SysTelemetry.UI
             var tf = snap.Traffic;
             if (tf == null) return;
 
+            if (_tfStatusDot != null && _tfStatusText != null)
+            {
+                _tfStatusDot.Fill = tf.EtwActive ? pal.StatusOk : pal.StatusWarn;
+                _tfStatusText.Text = tf.EtwStatusText ?? string.Empty;
+            }
+            if (_showApplicationTraffic)
+            {
+                RenderApplicationTraffic(tf.EtwActive, pal);
+                return;
+            }
+
             var today = tf.Today;
             if (today != null)
             {
@@ -388,18 +413,6 @@ namespace SysTelemetry.UI
                     ThemeHelper.FormatDataSize(cycle.DirectTotal),
                     cycle.GlobalTotal > 0 ? (1.0 - cycle.ProxyRatio) * 100.0 : 0.0);
                 _tfMonthRatioText.Text = string.Format("代理 {0:0.0}%", cycle.ProxyRatio * 100.0);
-            }
-
-            if (_tfStatusDot != null && _tfStatusText != null)
-            {
-                if (!tf.EtwActive)
-                    _tfStatusDot.Fill = pal.StatusWarn;
-                else if (tf.EtwStatusText != null && tf.EtwStatusText.IndexOf("待命", StringComparison.Ordinal) >= 0)
-                    _tfStatusDot.Fill = pal.AccentBlue;
-                else
-                    _tfStatusDot.Fill = pal.StatusOk;
-
-                _tfStatusText.Text = tf.EtwStatusText ?? string.Empty;
             }
 
             var series = _trafficMonthlyMode ? tf.MonthlyHistory : tf.DailyHistory;
@@ -1026,6 +1039,43 @@ namespace SysTelemetry.UI
         private void BuildTrafficView()
         {
             _trafficView = new StackPanel();
+            _trafficOverview = new StackPanel();
+            _applicationTrafficView = new StackPanel { Visibility = Visibility.Collapsed };
+
+            var navigation = new DockPanel { Margin = new Thickness(0, 0, 0, 9), LastChildFill = false };
+            var viewSelector = MakeSegmentedControl(new[]
+            {
+                Tuple.Create("总览", (object)false), Tuple.Create("按应用", (object)true)
+            }, _trafficViewButtons, false, value =>
+            {
+                _showApplicationTraffic = (bool)value;
+                _trafficOverview.Visibility = _showApplicationTraffic ? Visibility.Collapsed : Visibility.Visible;
+                _applicationTrafficView.Visibility = _showApplicationTraffic ? Visibility.Visible : Visibility.Collapsed;
+                _applicationPeriodSelector.Visibility = _applicationTrafficView.Visibility;
+                var pal = ThemeHelper.GetPalette(_config.Theme);
+                HighlightSelected(_trafficViewButtons, _showApplicationTraffic, pal);
+                if (_trafficScroll != null) _trafficScroll.ScrollToTop();
+                if (_lastSnap != null) UpdateTrafficView(_lastSnap, pal);
+            });
+            navigation.Children.Add(viewSelector);
+
+            _applicationPeriodSelector = MakeSegmentedControl(new[]
+            {
+                Tuple.Create("今日", (object)false), Tuple.Create("本周期", (object)true)
+            }, _applicationPeriodButtons, false, value =>
+            {
+                _applicationCycleMode = (bool)value;
+                var pal = ThemeHelper.GetPalette(_config.Theme);
+                HighlightSelected(_applicationPeriodButtons, _applicationCycleMode, pal);
+                if (_lastSnap != null) UpdateTrafficView(_lastSnap, pal);
+            });
+            _applicationPeriodSelector.Visibility = Visibility.Collapsed;
+            DockPanel.SetDock(_applicationPeriodSelector, Dock.Right);
+            navigation.Children.Add(_applicationPeriodSelector);
+            _trafficView.Children.Add(navigation);
+            _trafficView.Children.Add(_trafficOverview);
+            _trafficView.Children.Add(_applicationTrafficView);
+            BuildApplicationTrafficView();
 
             // ── Section 1: TODAY ──
             var todayHeader = new DockPanel { Margin = new Thickness(3, 0, 3, 4) };
@@ -1044,9 +1094,9 @@ namespace SysTelemetry.UI
             _tfTodaySectionTitle = MakeSectionLabel("TODAY");
             _tfTodaySectionTitle.Margin = new Thickness(0);
             todayHeader.Children.Add(_tfTodaySectionTitle);
-            _trafficView.Children.Add(todayHeader);
+            _trafficOverview.Children.Add(todayHeader);
 
-            _trafficView.Children.Add(BuildTrafficPeriodBlock(
+            _trafficOverview.Children.Add(BuildTrafficPeriodBlock(
                 out _tfTodayGlobalMain, out _tfTodayGlobalSub,
                 out _tfTodayProxyMain, out _tfTodayProxySub, out _tfTodayProxyBadgeText,
                 out _tfTodayBarTrack, out _tfTodayBarProxy,
@@ -1075,9 +1125,9 @@ namespace SysTelemetry.UI
             _tfMonthSectionTitle = MakeSectionLabel("MONTH");
             _tfMonthSectionTitle.Margin = new Thickness(0);
             monthHeader.Children.Add(_tfMonthSectionTitle);
-            _trafficView.Children.Add(monthHeader);
+            _trafficOverview.Children.Add(monthHeader);
 
-            _trafficView.Children.Add(BuildTrafficPeriodBlock(
+            _trafficOverview.Children.Add(BuildTrafficPeriodBlock(
                 out _tfMonthGlobalMain, out _tfMonthGlobalSub,
                 out _tfMonthProxyMain, out _tfMonthProxySub, out _tfMonthProxyBadgeText,
                 out _tfMonthBarTrack, out _tfMonthBarProxy,
@@ -1137,7 +1187,7 @@ namespace SysTelemetry.UI
             histLeft.Children.Add(new Border { Width = 7 });
             histLeft.Children.Add(MakeLegendDot("直连", "#38BDF8"));
             histHead.Children.Add(histLeft);
-            _trafficView.Children.Add(histHead);
+            _trafficOverview.Children.Add(histHead);
 
             // Stacked bar chart card
             var chartCard = new Border
@@ -1168,7 +1218,7 @@ namespace SysTelemetry.UI
             chartCardStack.Children.Add(_tfChartLabelsGrid);
 
             chartCard.Child = chartCardStack;
-            _trafficView.Children.Add(chartCard);
+            _trafficOverview.Children.Add(chartCard);
 
             // Table column header
             var colHead = new Grid { Margin = new Thickness(6, 0, 12, 3) };
@@ -1183,7 +1233,7 @@ namespace SysTelemetry.UI
             var c3 = new TextBlock { Text = "占比", FontFamily = UiFont, FontSize = 9.5, TextAlignment = TextAlignment.Right, Tag = "Muted" };
             Grid.SetColumn(c0, 0); Grid.SetColumn(c1, 1); Grid.SetColumn(c2, 2); Grid.SetColumn(c3, 3);
             colHead.Children.Add(c0); colHead.Children.Add(c1); colHead.Children.Add(c2); colHead.Children.Add(c3);
-            _trafficView.Children.Add(colHead);
+            _trafficOverview.Children.Add(colHead);
 
             _tfHistoryRows = new StackPanel { Margin = new Thickness(0, 0, 2, 0) };
             var rowsScroll = new ScrollViewer
@@ -1195,7 +1245,7 @@ namespace SysTelemetry.UI
                 Margin = new Thickness(0, 0, 0, 7)
             };
             ApplyThinScrollBarStyle(rowsScroll);
-            _trafficView.Children.Add(rowsScroll);
+            _trafficOverview.Children.Add(rowsScroll);
 
             // ── Footer: ETW status + quick reset ──
             var footer = new Border
@@ -1227,6 +1277,99 @@ namespace SysTelemetry.UI
 
             footer.Child = footerDp;
             _trafficView.Children.Add(footer);
+        }
+
+        private void BuildApplicationTrafficView()
+        {
+            var header = MakeApplicationTrafficRow(true);
+            string[] labels = { "应用 / 进程", "下载 ↓", "上传 ↑", "合计", "代理" };
+            for (int i = 0; i < labels.Length; i++)
+                ((TextBlock)header.Children[i]).Text = labels[i];
+            ((TextBlock)header.Children[4]).ToolTip = "应用经本机代理端口的下载与上传合计，包含在本行合计内。";
+            _applicationTrafficView.Children.Add(header);
+
+            _applicationRows = new StackPanel();
+            var scroll = new ScrollViewer
+            {
+                MaxHeight = 310,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                Content = _applicationRows,
+                Margin = new Thickness(0, 0, 0, 7)
+            };
+            ApplyThinScrollBarStyle(scroll);
+            _applicationTrafficView.Children.Add(scroll);
+            _applicationEmpty = new TextBlock
+            {
+                Text = "暂无应用流量",
+                FontFamily = UiFont,
+                FontSize = 11,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Margin = new Thickness(0, 24, 0, 30),
+                Tag = "Muted"
+            };
+            _applicationTrafficView.Children.Add(_applicationEmpty);
+        }
+
+        private void RenderApplicationTraffic(bool etwActive, ThemePalette pal)
+        {
+            var items = _getApplicationTraffic(_applicationCycleMode);
+            _applicationEmpty.Visibility = items.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+            _applicationEmpty.Text = etwActive ? "暂无应用流量" : "应用流量采集未启动";
+            while (_applicationRows.Children.Count > items.Count)
+                _applicationRows.Children.RemoveAt(_applicationRows.Children.Count - 1);
+
+            for (int i = 0; i < items.Count; i++)
+            {
+                if (i == _applicationRows.Children.Count)
+                    _applicationRows.Children.Add(MakeApplicationTrafficRow(false));
+                var row = (Grid)_applicationRows.Children[i];
+                var name = (TextBlock)row.Children[0];
+                name.Text = items[i].Key;
+                name.ToolTip = items[i].Key;
+                var traffic = items[i].Value;
+                ((TextBlock)row.Children[1]).Text = ThemeHelper.FormatDataSize(traffic.Received);
+                ((TextBlock)row.Children[2]).Text = ThemeHelper.FormatDataSize(traffic.Sent);
+                ((TextBlock)row.Children[3]).Text = ThemeHelper.FormatDataSize(traffic.Total);
+                var proxy = (TextBlock)row.Children[4];
+                proxy.Text = traffic.LocalProxyBytes.HasValue
+                    ? ThemeHelper.FormatDataSize(traffic.LocalProxyBytes.Value)
+                    : "—";
+                proxy.ToolTip = traffic.LocalProxyBytes.HasValue ? null : "旧记录无代理明细";
+                row.Background = i % 2 == 0 ? pal.SubSurfaceBackground : Brushes.Transparent;
+                ApplyPaletteToTree(row, pal);
+            }
+        }
+
+        private static Grid MakeApplicationTrafficRow(bool header)
+        {
+            var row = new Grid
+            {
+                Height = header ? 23 : 24,
+                Margin = new Thickness(0, 0, header ? 5 : 0, 0)
+            };
+            for (int i = 0; i < 5; i++)
+            {
+                row.ColumnDefinitions.Add(new ColumnDefinition
+                {
+                    Width = i == 0 ? new GridLength(1, GridUnitType.Star) : new GridLength(58)
+                });
+                var cell = new TextBlock
+                {
+                    FontFamily = i == 0 || header ? UiFont : MonoFont,
+                    FontSize = header ? 10 : 11,
+                    FontWeight = i == 3 && !header ? FontWeights.SemiBold : FontWeights.Normal,
+                    Margin = i == 0 ? new Thickness(7, 0, 5, 0) : new Thickness(0, 0, 7, 0),
+                    TextAlignment = i == 0 ? TextAlignment.Left : TextAlignment.Right,
+                    TextTrimming = TextTrimming.CharacterEllipsis,
+                    VerticalAlignment = VerticalAlignment.Center,
+                    Tag = header ? "Muted" : null
+                };
+                Typography.SetNumeralAlignment(cell, FontNumeralAlignment.Tabular);
+                Grid.SetColumn(cell, i);
+                row.Children.Add(cell);
+            }
+            return row;
         }
 
         private StackPanel BuildTrafficPeriodBlock(
@@ -1642,6 +1785,7 @@ namespace SysTelemetry.UI
             stepPanel.Children.Add(btnDayInc);
             stepTrack.Child = stepPanel;
             var resetDayRow = MakeRowShell(IconFactory.CalendarSvg, "流量重置日", stepTrack);
+            resetDayRow.ToolTip = "设置每月统计周期的起始日期。";
 
             // Proxy process names row (header + inline textbox)
             var proxyRow = new Border
@@ -1690,7 +1834,7 @@ namespace SysTelemetry.UI
                 Padding = new Thickness(6, 4, 6, 4),
                 BorderThickness = new Thickness(0),
                 Background = Brushes.Transparent,
-                ToolTip = "逗号分隔代理进程名（无需 .exe），失焦或回车生效",
+                ToolTip = "填代理核心的进程名，如 sing-box。多个名称用逗号分隔，留空关闭总览代理统计，按回车保存。",
                 Tag = "ConfigInput"
             };
             _txtProxyProcesses.KeyDown += (s, e) =>
@@ -1712,6 +1856,38 @@ namespace SysTelemetry.UI
                 Child = _txtProxyProcesses
             };
             proxyStack.Children.Add(proxyInputShell);
+            proxyStack.Children.Add(new TextBlock
+            {
+                Text = "额外本机代理端口（选填）",
+                FontFamily = UiFont,
+                FontSize = 10.5,
+                Margin = new Thickness(0, 8, 0, 4),
+                Tag = "Muted"
+            });
+            _txtLocalProxyPorts = new TextBox
+            {
+                FontFamily = MonoFont,
+                FontSize = 10.5,
+                Padding = new Thickness(6, 4, 6, 4),
+                BorderThickness = new Thickness(0),
+                ToolTip = "自动读取 Windows 保存的本机代理端口。应用单独指定的 HTTP 或 SOCKS 端口可填在这里，例如 10808。",
+                Tag = "ConfigInput"
+            };
+            _txtLocalProxyPorts.KeyDown += (s, e) =>
+            {
+                if (e.Key != Key.Enter) return;
+                CommitLocalProxyPorts();
+                Keyboard.ClearFocus();
+                e.Handled = true;
+            };
+            _txtLocalProxyPorts.LostFocus += (s, e) => CommitLocalProxyPorts();
+            proxyStack.Children.Add(new Border
+            {
+                CornerRadius = new CornerRadius(6),
+                BorderThickness = new Thickness(1),
+                Tag = "InputShell",
+                Child = _txtLocalProxyPorts
+            });
             proxyRow.Child = proxyStack;
 
             // Data reset actions row
@@ -1794,6 +1970,8 @@ namespace SysTelemetry.UI
                     _lblTrafficResetDay.Text = string.Format("每月 {0} 日", _config.TrafficResetDay);
                 if (_txtProxyProcesses != null && !_txtProxyProcesses.IsKeyboardFocusWithin)
                     _txtProxyProcesses.Text = _config.ProxyProcessNames ?? AppConfig.DefaultProxyProcessNames;
+                if (_txtLocalProxyPorts != null && !_txtLocalProxyPorts.IsKeyboardFocusWithin)
+                    _txtLocalProxyPorts.Text = _config.LocalProxyPorts ?? string.Empty;
                 HighlightSelected(_skinButtons, _config.Skin, pal);
                 HighlightSelected(_themeButtons, _config.Theme, pal);
                 HighlightSelected(_rateButtons, _config.PollIntervalMs, pal);
@@ -1822,6 +2000,16 @@ namespace SysTelemetry.UI
             string cleaned = (_txtProxyProcesses.Text ?? string.Empty).Trim();
             if (string.Equals(cleaned, _config.ProxyProcessNames, StringComparison.Ordinal)) return;
             _config.ProxyProcessNames = cleaned;
+            _config.Save();
+            if (TrafficConfigChanged != null) TrafficConfigChanged();
+        }
+
+        private void CommitLocalProxyPorts()
+        {
+            if (_txtLocalProxyPorts == null || _suppressSwitchEvents) return;
+            string ports = _txtLocalProxyPorts.Text.Trim();
+            if (ports == (_config.LocalProxyPorts ?? string.Empty)) return;
+            _config.LocalProxyPorts = ports;
             _config.Save();
             if (TrafficConfigChanged != null) TrafficConfigChanged();
         }
@@ -1878,7 +2066,10 @@ namespace SysTelemetry.UI
         public void SetViewMode(PopoverViewMode mode)
         {
             if (_activeView == PopoverViewMode.Settings && mode != PopoverViewMode.Settings)
+            {
                 CommitProxyProcessNames();
+                CommitLocalProxyPorts();
+            }
 
             ClearPendingConfirmStates();
             _activeView = mode;
@@ -1938,6 +2129,8 @@ namespace SysTelemetry.UI
             HighlightSelected(_tempButtons, _config.TempWarnThreshold, pal);
             HighlightSelected(_dockButtons, _config.TaskbarDock, pal);
             HighlightSelected(_trafficHistoryButtons, _trafficMonthlyMode, pal);
+            HighlightSelected(_trafficViewButtons, _showApplicationTraffic, pal);
+            HighlightSelected(_applicationPeriodButtons, _applicationCycleMode, pal);
             UpdateOffsetReadout();
 
             if (_lastSnap != null)
@@ -2375,6 +2568,11 @@ namespace SysTelemetry.UI
 
         private Border MakeSegmentedRow(string svgPath, string title, Tuple<string, object>[] options, List<Button> bucket, bool useMonoFont, Action<object> onSelect)
         {
+            return MakeRowShell(svgPath, title, MakeSegmentedControl(options, bucket, useMonoFont, onSelect));
+        }
+
+        private static Border MakeSegmentedControl(Tuple<string, object>[] options, List<Button> bucket, bool useMonoFont, Action<object> onSelect)
+        {
             var track = new Border
             {
                 CornerRadius = new CornerRadius(7),
@@ -2407,7 +2605,7 @@ namespace SysTelemetry.UI
             }
 
             track.Child = segPanel;
-            return MakeRowShell(svgPath, title, track);
+            return track;
         }
 
         private static Button MakeGhostIconButton(string svgPath, string text, Action onClick)
