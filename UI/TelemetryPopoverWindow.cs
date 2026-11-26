@@ -1829,6 +1829,7 @@ namespace SysTelemetry.UI
 
             _txtProxyProcesses = new TextBox
             {
+                Text = _config.ProxyProcessNames ?? AppConfig.DefaultProxyProcessNames,
                 FontFamily = MonoFont,
                 FontSize = 10.5,
                 Padding = new Thickness(6, 4, 6, 4),
@@ -1866,6 +1867,7 @@ namespace SysTelemetry.UI
             });
             _txtLocalProxyPorts = new TextBox
             {
+                Text = _config.LocalProxyPorts ?? string.Empty,
                 FontFamily = MonoFont,
                 FontSize = 10.5,
                 Padding = new Thickness(6, 4, 6, 4),
@@ -1996,7 +1998,7 @@ namespace SysTelemetry.UI
 
         private void CommitProxyProcessNames()
         {
-            if (_txtProxyProcesses == null || _suppressSwitchEvents) return;
+            if (_activeView != PopoverViewMode.Settings || _suppressSwitchEvents) return;
             string cleaned = (_txtProxyProcesses.Text ?? string.Empty).Trim();
             if (string.Equals(cleaned, _config.ProxyProcessNames, StringComparison.Ordinal)) return;
             _config.ProxyProcessNames = cleaned;
@@ -2006,7 +2008,7 @@ namespace SysTelemetry.UI
 
         private void CommitLocalProxyPorts()
         {
-            if (_txtLocalProxyPorts == null || _suppressSwitchEvents) return;
+            if (_activeView != PopoverViewMode.Settings || _suppressSwitchEvents) return;
             string ports = _txtLocalProxyPorts.Text.Trim();
             if (ports == (_config.LocalProxyPorts ?? string.Empty)) return;
             _config.LocalProxyPorts = ports;
