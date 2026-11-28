@@ -10,8 +10,72 @@ namespace SysTelemetry.Models
         [DataMember] public long Received { get; set; }
         [DataMember] public long Sent { get; set; }
         [DataMember(EmitDefaultValue = false)] public long? LocalProxyBytes { get; set; }
+        [DataMember(EmitDefaultValue = false)] public long DirectBytes { get; set; }
+        [DataMember(EmitDefaultValue = false)] public long NodeBytes { get; set; }
+        [DataMember(EmitDefaultValue = false)] public string ApplicationName { get; set; }
+        [DataMember(EmitDefaultValue = false)] public Dictionary<string, ApplicationTraffic> Processes { get; set; }
 
-        public long Total { get { return Received + Sent; } }
+        public long Total
+        {
+            get
+            {
+                if (Processes == null || Processes.Count == 0)
+                    return Math.Max(Received + Sent, DirectBytes + NodeBytes);
+                long total = 0;
+                foreach (var process in Processes.Values)
+                    total += process.Total;
+                return total;
+            }
+        }
+        public long UnclassifiedBytes { get { return Total - DirectBytes - NodeBytes; } }
+
+        internal ApplicationTraffic GetProcessTraffic(ApplicationProcess process)
+        {
+            if (Processes == null)
+                Processes = new Dictionary<string, ApplicationTraffic>(StringComparer.OrdinalIgnoreCase);
+            ApplicationTraffic counter;
+            if (!Processes.TryGetValue(process.ProcessKey, out counter))
+            {
+                counter = new ApplicationTraffic { ApplicationName = process.ProcessName };
+                Processes.Add(process.ProcessKey, counter);
+            }
+            return counter;
+        }
+
+        internal static ApplicationTraffic GetAppTraffic(Dictionary<string, ApplicationTraffic> counters, ApplicationProcess process)
+        {
+            ApplicationTraffic counter;
+            if (!counters.TryGetValue(process.AppKey, out counter))
+            {
+                counter = new ApplicationTraffic { ApplicationName = process.AppName };
+                counters.Add(process.AppKey, counter);
+            }
+            return counter;
+        }
+    }
+
+    internal sealed class ApplicationProcess
+    {
+        public string ProcessKey { get; private set; }
+        public string ProcessName { get; private set; }
+        public string AppKey { get; private set; }
+        public string AppName { get; private set; }
+        public string AppPath { get; private set; }
+        public string Package { get; private set; }
+        public long Created { get; private set; }
+
+        public ApplicationProcess(string path, string name, string appPath, string package, long created)
+        {
+            ProcessKey = path ?? "process:" + name;
+            ProcessName = name;
+            AppPath = appPath ?? path;
+            Package = package;
+            AppKey = package != null ? "package:" + package : AppPath ?? ProcessKey;
+            int publisherSeparator = package == null ? -1 : package.LastIndexOf('_');
+            AppName = package != null ? (publisherSeparator > 0 ? package.Substring(0, publisherSeparator) : package) :
+                AppPath != null ? System.IO.Path.GetFileNameWithoutExtension(AppPath) : name;
+            Created = created;
+        }
     }
 
     [DataContract]
@@ -22,11 +86,12 @@ namespace SysTelemetry.Models
         [DataMember] public long GlobalTx { get; set; }
         [DataMember] public long ProxyRx { get; set; }
         [DataMember] public long ProxyTx { get; set; }
+        [DataMember(EmitDefaultValue = false)] public long NodeRx { get; set; }
+        [DataMember(EmitDefaultValue = false)] public long NodeTx { get; set; }
+        [DataMember(EmitDefaultValue = false)] public long ClassifiedRx { get; set; }
+        [DataMember(EmitDefaultValue = false)] public long ClassifiedTx { get; set; }
         [DataMember(EmitDefaultValue = false)] public Dictionary<string, ApplicationTraffic> Applications { get; set; }
 
-        public long GlobalTotal { get { return GlobalRx + GlobalTx; } }
-        public long ProxyTotal { get { return ProxyRx + ProxyTx; } }
-        public long DirectTotal { get { return Math.Max(0L, GlobalTotal - ProxyTotal); } }
     }
 
     [DataContract]
@@ -37,7 +102,7 @@ namespace SysTelemetry.Models
 
         public TrafficStoreData()
         {
-            Version = 1;
+            Version = 3;
             Days = new List<DailyTrafficRecord>();
         }
     }
@@ -51,13 +116,17 @@ namespace SysTelemetry.Models
         public long GlobalTx { get; set; }
         public long ProxyRx { get; set; }
         public long ProxyTx { get; set; }
+        public long ClassifiedRx { get; set; }
+        public long ClassifiedTx { get; set; }
         public bool IsCurrent { get; set; }
 
         public long GlobalTotal { get { return GlobalRx + GlobalTx; } }
-        public long ProxyTotal { get { return Math.Min(GlobalTotal, ProxyRx + ProxyTx); } }
-        public long DirectRx { get { return Math.Max(0L, GlobalRx - ProxyRx); } }
-        public long DirectTx { get { return Math.Max(0L, GlobalTx - ProxyTx); } }
-        public long DirectTotal { get { return Math.Max(0L, GlobalTotal - ProxyTotal); } }
+        public long ProxyTotal { get { return ProxyRx + ProxyTx; } }
+        public long DirectTotal
+        {
+            get { return Math.Max(0, ClassifiedRx - ProxyRx) + Math.Max(0, ClassifiedTx - ProxyTx); }
+        }
+        public long UnclassifiedTotal { get { return Math.Max(0, GlobalTotal - ProxyTotal - DirectTotal); } }
         public double ProxyRatio
         {
             get

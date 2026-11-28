@@ -1,10 +1,9 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
 using System.Runtime.Serialization.Json;
@@ -37,6 +36,8 @@ namespace SysTelemetry.Services
         private readonly object _saveLock = new object();
         private readonly Dictionary<string, DailyTrafficRecord> _days = new Dictionary<string, DailyTrafficRecord>(StringComparer.Ordinal);
         private readonly EtwNetworkTracker _etw;
+        private readonly ApplicationProcessCatalog _processCatalog = new ApplicationProcessCatalog();
+        private readonly SingBoxTrafficRoutes _routes = new SingBoxTrafficRoutes();
 
         private DateTime _lastSaveUtc = DateTime.UtcNow;
         private DateTime _lastPidRefreshUtc = DateTime.MinValue;
@@ -58,7 +59,7 @@ namespace SysTelemetry.Services
         {
             _config = config;
             LoadFromDisk();
-            _etw = new EtwNetworkTracker();
+            _etw = new EtwNetworkTracker(_processCatalog);
             RefreshProxyProcesses(force: true);
             _etw.Start();
         }
@@ -157,8 +158,11 @@ namespace SysTelemetry.Services
 
             lock (_storeLock)
             {
-                long proxyDeltaRx, proxyDeltaTx;
-                var applications = _etw.DrainBytes(out proxyDeltaRx, out proxyDeltaTx);
+                _routes.Refresh(_config.ProxyNodeEndpoints, _config.ProxyController);
+                _etw.Outbounds = _routes.Outbounds;
+                long proxyDeltaRx, proxyDeltaTx, unknownRx, unknownTx;
+                var applications = _etw.DrainBytes(out proxyDeltaRx, out proxyDeltaTx, out unknownRx, out unknownTx);
+                _routes.Collect(applications, _processCatalog);
                 if (proxyDeltaRx < 0 || proxyDeltaRx > maxTickBytes) proxyDeltaRx = 0;
                 if (proxyDeltaTx < 0 || proxyDeltaTx > maxTickBytes) proxyDeltaTx = 0;
 
@@ -183,13 +187,13 @@ namespace SysTelemetry.Services
                 {
                     rec.GlobalRx += globalDeltaRx;
                     rec.GlobalTx += globalDeltaTx;
-                    rec.ProxyRx += proxyDeltaRx;
-                    rec.ProxyTx += proxyDeltaTx;
-
-                    // Prevent unbounded drift if ETW ever counts non-NIC traffic, while allowing brief flush skew
-                    const long skewAllowance = 32L * 1024 * 1024;
-                    if (rec.ProxyRx > rec.GlobalRx + skewAllowance) rec.ProxyRx = rec.GlobalRx;
-                    if (rec.ProxyTx > rec.GlobalTx + skewAllowance) rec.ProxyTx = rec.GlobalTx;
+                    rec.NodeRx += proxyDeltaRx;
+                    rec.NodeTx += proxyDeltaTx;
+                    if (_etw.IsRunning)
+                    {
+                        rec.ClassifiedRx += Math.Max(0, globalDeltaRx - unknownRx);
+                        rec.ClassifiedTx += Math.Max(0, globalDeltaTx - unknownTx);
+                    }
 
                     _dirty = true;
                 }
@@ -244,14 +248,22 @@ namespace SysTelemetry.Services
                 ApplicationTraffic total;
                 if (!totals.TryGetValue(item.Key, out total))
                 {
-                    total = new ApplicationTraffic();
+                    total = new ApplicationTraffic { ApplicationName = item.Value.ApplicationName };
                     totals.Add(item.Key, total);
                 }
                 total.Received += Math.Max(0L, item.Value.Received);
                 total.Sent += Math.Max(0L, item.Value.Sent);
+                total.DirectBytes += Math.Max(0L, item.Value.DirectBytes);
+                total.NodeBytes += Math.Max(0L, item.Value.NodeBytes);
                 if (item.Value.LocalProxyBytes.HasValue)
                     total.LocalProxyBytes = total.LocalProxyBytes.GetValueOrDefault() +
                         Math.Max(0L, item.Value.LocalProxyBytes.Value);
+                if (item.Value.Processes != null)
+                {
+                    if (total.Processes == null)
+                        total.Processes = new Dictionary<string, ApplicationTraffic>(StringComparer.OrdinalIgnoreCase);
+                    AddApplicationTraffic(total.Processes, item.Value.Processes);
+                }
             }
         }
 
@@ -260,8 +272,9 @@ namespace SysTelemetry.Services
             string todayKey = DateTime.Now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
             lock (_storeLock)
             {
-                long dummyRx, dummyTx;
-                _etw.DrainBytes(out dummyRx, out dummyTx);
+                long discarded;
+                _etw.DrainBytes(out discarded, out discarded, out discarded, out discarded);
+                _routes.Reset();
                 _days[todayKey] = new DailyTrafficRecord { Date = todayKey };
                 _dirty = true;
             }
@@ -273,8 +286,9 @@ namespace SysTelemetry.Services
             string todayKey = DateTime.Now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
             lock (_storeLock)
             {
-                long dummyRx, dummyTx;
-                _etw.DrainBytes(out dummyRx, out dummyTx);
+                long discarded;
+                _etw.DrainBytes(out discarded, out discarded, out discarded, out discarded);
+                _routes.Reset();
                 _days.Clear();
                 _days[todayKey] = new DailyTrafficRecord { Date = todayKey };
                 _dirty = true;
@@ -295,7 +309,7 @@ namespace SysTelemetry.Services
             _lastPidRefreshUtc = nowUtc;
 
             var names = ParseProxyProcessNames(_config.ProxyProcessNames);
-            _etw.UpdateProcesses(names, ReadLocalProxyPorts(_config.LocalProxyPorts));
+            _etw.UpdateProcesses(names, ReadLocalProxyPorts(_config.LocalProxyPorts), _config.ApplicationGroups);
         }
 
         private static HashSet<string> ParseProxyProcessNames(string raw)
@@ -352,7 +366,8 @@ namespace SysTelemetry.Services
             {
                 ResetDay = resetDay,
                 EtwActive = _etw.IsRunning,
-                EtwStatusText = _etw.StatusText
+                EtwStatusText = !_etw.IsRunning ? _etw.StatusText :
+                    _routes.ControllerAvailable ? "ETW · 应用路由已连接" : "ETW · 应用路由未连接"
             };
 
             string todayKey = today.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
@@ -364,8 +379,10 @@ namespace SysTelemetry.Services
                 todayKey,
                 todayRec != null ? todayRec.GlobalRx : 0,
                 todayRec != null ? todayRec.GlobalTx : 0,
-                todayRec != null ? todayRec.ProxyRx : 0,
-                todayRec != null ? todayRec.ProxyTx : 0,
+                todayRec != null ? todayRec.NodeRx : 0,
+                todayRec != null ? todayRec.NodeTx : 0,
+                todayRec != null ? todayRec.ClassifiedRx : 0,
+                todayRec != null ? todayRec.ClassifiedTx : 0,
                 true);
 
             // Daily history: last 14 days (oldest -> newest)
@@ -382,8 +399,10 @@ namespace SysTelemetry.Services
                     key,
                     rec != null ? rec.GlobalRx : 0,
                     rec != null ? rec.GlobalTx : 0,
-                    rec != null ? rec.ProxyRx : 0,
-                    rec != null ? rec.ProxyTx : 0,
+                    rec != null ? rec.NodeRx : 0,
+                    rec != null ? rec.NodeTx : 0,
+                    rec != null ? rec.ClassifiedRx : 0,
+                    rec != null ? rec.ClassifiedTx : 0,
                     i == 0));
             }
 
@@ -396,7 +415,7 @@ namespace SysTelemetry.Services
                 DateTime nextM = m.AddMonths(1);
                 DateTime end = GetCycleStartForMonth(nextM.Year, nextM.Month, resetDay).AddDays(-1);
 
-                long gRx = 0, gTx = 0, pRx = 0, pTx = 0;
+                long gRx = 0, gTx = 0, pRx = 0, pTx = 0, cRx = 0, cTx = 0;
                 for (DateTime d = start; d <= end; d = d.AddDays(1))
                 {
                     DailyTrafficRecord rec;
@@ -404,8 +423,10 @@ namespace SysTelemetry.Services
                     {
                         gRx += rec.GlobalRx;
                         gTx += rec.GlobalTx;
-                        pRx += Math.Min(rec.GlobalRx, rec.ProxyRx);
-                        pTx += Math.Min(rec.GlobalTx, rec.ProxyTx);
+                        pRx += rec.NodeRx;
+                        pTx += rec.NodeTx;
+                        cRx += rec.ClassifiedRx;
+                        cTx += rec.ClassifiedTx;
                     }
                 }
 
@@ -427,7 +448,7 @@ namespace SysTelemetry.Services
                     shortLabel = start.ToString("M/d", CultureInfo.InvariantCulture);
                 }
 
-                var summary = MakePeriodSummary(label, shortLabel, rangeText, gRx, gTx, pRx, pTx, i == 0);
+                var summary = MakePeriodSummary(label, shortLabel, rangeText, gRx, gTx, pRx, pTx, cRx, cTx, i == 0);
                 snap.MonthlyHistory.Add(summary);
                 if (i == 0) snap.CurrentCycle = summary;
             }
@@ -437,10 +458,8 @@ namespace SysTelemetry.Services
 
         private static TrafficPeriodSummary MakePeriodSummary(
             string label, string shortLabel, string rangeText,
-            long gRx, long gTx, long pRx, long pTx, bool isCurrent)
+            long gRx, long gTx, long pRx, long pTx, long cRx, long cTx, bool isCurrent)
         {
-            long effProxyRx = Math.Max(0L, Math.Min(gRx, pRx));
-            long effProxyTx = Math.Max(0L, Math.Min(gTx, pTx));
             return new TrafficPeriodSummary
             {
                 Label = label,
@@ -448,8 +467,10 @@ namespace SysTelemetry.Services
                 RangeText = rangeText,
                 GlobalRx = Math.Max(0L, gRx),
                 GlobalTx = Math.Max(0L, gTx),
-                ProxyRx = effProxyRx,
-                ProxyTx = effProxyTx,
+                ProxyRx = Math.Max(0L, pRx),
+                ProxyTx = Math.Max(0L, pTx),
+                ClassifiedRx = Math.Min(gRx, Math.Max(0L, cRx)),
+                ClassifiedTx = Math.Min(gTx, Math.Max(0L, cTx)),
                 IsCurrent = isCurrent
             };
         }
@@ -493,7 +514,7 @@ namespace SysTelemetry.Services
 
                 using (var ms = new MemoryStream(Encoding.UTF8.GetBytes(json)))
                 {
-                    var ser = new DataContractJsonSerializer(typeof(TrafficStoreData));
+                    var ser = CreateTrafficSerializer();
                     var data = ser.ReadObject(ms) as TrafficStoreData;
                     if (data == null || data.Days == null) return;
 
@@ -510,6 +531,10 @@ namespace SysTelemetry.Services
                                 GlobalTx = Math.Max(0L, d.GlobalTx),
                                 ProxyRx = Math.Max(0L, d.ProxyRx),
                                 ProxyTx = Math.Max(0L, d.ProxyTx),
+                                NodeRx = Math.Max(0L, d.NodeRx),
+                                NodeTx = Math.Max(0L, d.NodeTx),
+                                ClassifiedRx = Math.Max(0L, d.ClassifiedRx),
+                                ClassifiedTx = Math.Max(0L, d.ClassifiedTx),
                                 Applications = d.Applications
                             };
                         }
@@ -538,7 +563,7 @@ namespace SysTelemetry.Services
                             {
                                 Days = _days.Values.OrderBy(x => x.Date, StringComparer.Ordinal).ToList()
                             };
-                            var ser = new DataContractJsonSerializer(typeof(TrafficStoreData));
+                            var ser = CreateTrafficSerializer();
                             ser.WriteObject(ms, payload);
                             _dirty = false;
                             _lastSaveUtc = DateTime.UtcNow;
@@ -561,6 +586,12 @@ namespace SysTelemetry.Services
             }
         }
 
+        private static DataContractJsonSerializer CreateTrafficSerializer()
+        {
+            return new DataContractJsonSerializer(typeof(TrafficStoreData),
+                new DataContractJsonSerializerSettings { MaxItemsInObjectGraph = int.MaxValue });
+        }
+
         public void Dispose()
         {
             if (_disposed) return;
@@ -577,7 +608,6 @@ namespace SysTelemetry.Services
         {
             private sealed class ProcessLookup
             {
-                public readonly ConcurrentDictionary<uint, string> Names = new ConcurrentDictionary<uint, string>();
                 public readonly HashSet<string> ProxyNames;
                 public readonly HashSet<int> LocalProxyPorts;
                 public readonly HashSet<uint> ProxyListeners;
@@ -751,15 +781,6 @@ namespace SysTelemetry.Services
             [DllImport("advapi32.dll")]
             private static extern uint CloseTrace(ulong traceHandle);
 
-            [DllImport("kernel32.dll")]
-            private static extern IntPtr OpenProcess(uint access, bool inheritHandle, uint processId);
-
-            [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-            private static extern bool QueryFullProcessImageName(IntPtr process, int flags, StringBuilder path, ref int size);
-
-            [DllImport("kernel32.dll")]
-            private static extern bool CloseHandle(IntPtr handle);
-
             [DllImport("iphlpapi.dll")]
             private static extern uint GetExtendedTcpTable(IntPtr table, ref int size, bool order,
                 int addressFamily, int tableClass, uint reserved);
@@ -788,8 +809,9 @@ namespace SysTelemetry.Services
             private volatile bool _stopping;
 
             private volatile ProcessLookup _processes;
-            private readonly ConcurrentDictionary<uint, Tuple<string, DateTime>> _recentProcesses =
-                new ConcurrentDictionary<uint, Tuple<string, DateTime>>();
+            private readonly ApplicationProcessCatalog _catalog;
+            private static readonly ApplicationProcess UnknownProcess =
+                new ApplicationProcess(null, "未知进程", null, null, 0);
             private volatile string _activeProxyNames = string.Empty;
             private volatile string _errorReason = string.Empty;
 
@@ -798,6 +820,14 @@ namespace SysTelemetry.Services
                 new Dictionary<string, ApplicationTraffic>(StringComparer.OrdinalIgnoreCase);
             private long _pendingRx;
             private long _pendingTx;
+            private long _unknownRx;
+            private long _unknownTx;
+            public volatile SingBoxTrafficRoutes.OutboundMap Outbounds;
+
+            public EtwNetworkTracker(ApplicationProcessCatalog catalog)
+            {
+                _catalog = catalog;
+            }
 
             public bool IsRunning { get { return _running; } }
 
@@ -817,32 +847,16 @@ namespace SysTelemetry.Services
                 }
             }
 
-            public void UpdateProcesses(HashSet<string> targetNames, HashSet<int> localProxyPorts)
+            public void UpdateProcesses(HashSet<string> targetNames, HashSet<int> localProxyPorts, string[] groups)
             {
                 var lookup = new ProcessLookup(targetNames, localProxyPorts);
                 var foundNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                Process[] processes;
-                try { processes = Process.GetProcesses(); }
-                catch { return; }
-                foreach (var process in processes)
+                foreach (var process in _catalog.Refresh(groups).Values)
                 {
-                    try
-                    {
-                        string name = process.ProcessName;
-                        lookup.Names.TryAdd((uint)process.Id, name);
-                        if (targetNames.Contains(name)) foundNames.Add(name);
-                    }
-                    catch { }
-                    finally { process.Dispose(); }
+                    if (targetNames.Contains(process.ProcessName)) foundNames.Add(process.ProcessName);
                 }
 
                 _processes = lookup;
-                DateTime cutoff = DateTime.UtcNow.AddSeconds(-30);
-                foreach (var entry in _recentProcesses)
-                {
-                    if (entry.Value.Item2 < cutoff)
-                        ((ICollection<KeyValuePair<uint, Tuple<string, DateTime>>>)_recentProcesses).Remove(entry);
-                }
                 _activeProxyNames = foundNames.Count > 0
                     ? string.Join(", ", foundNames.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
                     : string.Empty;
@@ -855,40 +869,28 @@ namespace SysTelemetry.Services
                 if (length < sizeof(uint) || data == IntPtr.Zero) return;
 
                 // Windows has multiple versions of this event. Resolve the name using its manifest.
-                IntPtr imageProperty = Marshal.StringToHGlobalUni("ImageName");
-                try
-                {
-                    var property = new PropertyDataDescriptor { PropertyName = imageProperty, ArrayIndex = uint.MaxValue };
-                    uint size;
-                    if (TdhGetPropertySize(record, 0, IntPtr.Zero, 1, ref property, out size) != 0 ||
-                        size < 2 || size > length) return;
-                    var value = new byte[size];
-                    if (TdhGetProperty(record, 0, IntPtr.Zero, 1, ref property, size, value) != 0) return;
-                    string image = Encoding.Unicode.GetString(value).TrimEnd('\0');
-                    int slash = Math.Max(image.LastIndexOf('\\'), image.LastIndexOf('/'));
-                    string name = image.Substring(slash + 1);
-                    if (name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
-                        name = name.Substring(0, name.Length - 4);
-                    if (name.Length > 0)
-                        _recentProcesses[(uint)Marshal.ReadInt32(data)] = Tuple.Create(name, DateTime.UtcNow);
-                }
-                finally { Marshal.FreeHGlobal(imageProperty); }
+                byte[] image = ReadEventProperty(record, "ImageName", length);
+                byte[] parent = ReadEventProperty(record, "ParentProcessID", length);
+                byte[] created = ReadEventProperty(record, "CreateTime", length);
+                if (image == null || image.Length < 2 || created == null || created.Length != sizeof(long)) return;
+                uint parentPid = parent != null && parent.Length == sizeof(uint) ? BitConverter.ToUInt32(parent, 0) : 0;
+                _catalog.RememberStart((uint)Marshal.ReadInt32(data), parentPid, BitConverter.ToInt64(created, 0),
+                    Encoding.Unicode.GetString(image).TrimEnd('\0'));
             }
 
-            private static string ReadProcessName(uint pid)
+            private static byte[] ReadEventProperty(IntPtr record, string name, int recordLength)
             {
-                const uint queryLimitedInformation = 0x1000;
-                IntPtr handle = OpenProcess(queryLimitedInformation, false, pid);
-                if (handle == IntPtr.Zero) return string.Empty;
+                IntPtr propertyName = Marshal.StringToHGlobalUni(name);
                 try
                 {
-                    var path = new StringBuilder(1024);
-                    int size = path.Capacity;
-                    return QueryFullProcessImageName(handle, 0, path, ref size)
-                        ? Path.GetFileNameWithoutExtension(path.ToString())
-                        : string.Empty;
+                    var property = new PropertyDataDescriptor { PropertyName = propertyName, ArrayIndex = uint.MaxValue };
+                    uint size;
+                    if (TdhGetPropertySize(record, 0, IntPtr.Zero, 1, ref property, out size) != 0 ||
+                        size == 0 || size > recordLength) return null;
+                    var value = new byte[size];
+                    return TdhGetProperty(record, 0, IntPtr.Zero, 1, ref property, size, value) == 0 ? value : null;
                 }
-                finally { CloseHandle(handle); }
+                finally { Marshal.FreeHGlobal(propertyName); }
             }
 
             private static HashSet<uint> FindProxyListeners(HashSet<int> ports)
@@ -1124,39 +1126,56 @@ namespace SysTelemetry.Services
                     return;
 
                 uint pid = (uint)Marshal.ReadInt32(userData, 0);
-                string name;
-                Tuple<string, DateTime> recent;
-                if (_recentProcesses.TryGetValue(pid, out recent))
-                    name = recent.Item1;
-                else if (!processes.Names.TryGetValue(pid, out name))
-                {
-                    name = ReadProcessName(pid);
-                    processes.Names.TryAdd(pid, name);
-                }
-                bool isProxy = processes.ProxyNames.Contains(name);
-                if (loopback && (isProxy || processes.ProxyListeners.Contains(pid))) return;
-                if (string.IsNullOrEmpty(name)) name = "未知进程";
+                var process = _catalog.FindByPid(pid) ?? UnknownProcess;
+                bool isProxy = processes.ProxyNames.Contains(process.ProcessName) || processes.ProxyListeners.Contains(pid);
+                if (loopback && isProxy) return;
 
+                var routes = Outbounds;
+                bool knownCore = routes != null && (routes.CorePid == 0 || routes.CorePid == pid);
+                bool isNode = isProxy && knownCore && dataLen >= minLen + 4 &&
+                    (routes.IsNode(ReadAddress(userData, 8, isIpv6), ReadNetworkPort(userData, minLen)) ||
+                     routes.IsNode(ReadAddress(userData, isIpv6 ? 24 : 12, isIpv6), ReadNetworkPort(userData, minLen + 2)));
                 lock (_pendingLock)
                 {
-                    ApplicationTraffic traffic;
-                    if (!_pendingApplications.TryGetValue(name, out traffic))
+                    if (isProxy)
                     {
-                        traffic = new ApplicationTraffic { LocalProxyBytes = 0 };
-                        _pendingApplications.Add(name, traffic);
+                        if (isNode)
+                        {
+                            if (isSend) _pendingTx += size;
+                            else _pendingRx += size;
+                        }
+                        else if (!knownCore || !routes.FullyResolved || dataLen < minLen + 4)
+                        {
+                            if (isSend) _unknownTx += size;
+                            else _unknownRx += size;
+                        }
+                        return;
                     }
-                    if (loopback) traffic.LocalProxyBytes += size;
+                    var traffic = ApplicationTraffic.GetAppTraffic(_pendingApplications, process);
+                    var detail = traffic.GetProcessTraffic(process);
+                    if (!loopback)
+                    {
+                        traffic.DirectBytes += size;
+                        detail.DirectBytes += size;
+                    }
                     if (isSend)
                     {
                         traffic.Sent += size;
-                        if (isProxy) _pendingTx += size;
+                        detail.Sent += size;
                     }
                     else
                     {
                         traffic.Received += size;
-                        if (isProxy) _pendingRx += size;
+                        detail.Received += size;
                     }
                 }
+            }
+
+            private static IPAddress ReadAddress(IntPtr data, int offset, bool ipv6)
+            {
+                var bytes = new byte[ipv6 ? 16 : 4];
+                Marshal.Copy(IntPtr.Add(data, offset), bytes, 0, bytes.Length);
+                return new IPAddress(bytes);
             }
 
             private static int ReadNetworkPort(IntPtr data, int offset)
@@ -1193,13 +1212,17 @@ namespace SysTelemetry.Services
                        Marshal.ReadByte(ptr, offset + 15) == 1;
             }
 
-            public Dictionary<string, ApplicationTraffic> DrainBytes(out long rx, out long tx)
+            public Dictionary<string, ApplicationTraffic> DrainBytes(out long rx, out long tx,
+                out long unknownRx, out long unknownTx)
             {
                 lock (_pendingLock)
                 {
                     rx = _pendingRx;
                     tx = _pendingTx;
                     _pendingRx = _pendingTx = 0;
+                    unknownRx = _unknownRx;
+                    unknownTx = _unknownTx;
+                    _unknownRx = _unknownTx = 0;
                     var applications = _pendingApplications;
                     _pendingApplications = new Dictionary<string, ApplicationTraffic>(StringComparer.OrdinalIgnoreCase);
                     return applications;

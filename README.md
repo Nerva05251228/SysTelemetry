@@ -16,7 +16,7 @@
    - **60S TRACE**：`CPU`、`GPU`、`TEMP` 三通道 60 秒实时趋势曲线。
    - **传感器卡片**：`CPU`（负载 / 封装温度 / 功耗 / 主频）、`GPU`（负载 / 核心温度 / 功耗 / 显存）、`MEM`（已用占比 / 可用容量）、`DISK`（NVMe 温度 / 读写速率）。
    - **今日流量摘要与独立统计页 (`SYS.TRAFFIC`)**：主面板透出实时网速与今日全局/代理汇总，点击或通过顶栏图标切换至 `SYS.TRAFFIC`，查看按天 / 按月（支持自定义每月重置日）的全局与代理总流量、下载/上行拆分、直连占比及 14 天 / 12 周期堆叠柱状图与明细列表。
-   - **按应用**：在流量页查看今日或本周期的应用下载、上传、合计，以及其中走本机代理的流量。
+   - **按应用**：在流量页查看今日或本周期的应用总用量，以及其中走代理节点、直连和未分类的用量。
    - **高占用进程 (`PROCESSES`)**：按 CPU / 内存 / 磁盘 IO 实时采样展示前 5 个高资源占用进程。
    - **头部快捷工具栏**：桌面单行悬浮角标开关、一键内存工作集清理 `TRIM`（含按钮弹性缩放旋转及 `MEM` 卡片翠绿脉冲反馈动画）、`SYS.TRAFFIC` 流量统计页切换、内嵌 `SYS.CONFIG` 设置页切换、关闭按钮。
 
@@ -96,21 +96,61 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 | `PollIntervalMs` | `1000` | 采样周期（`500` / `1000` / `2000` ms） |
 | `TempWarnThreshold` | `80` | 高温预警阈值（`75` / `80` / `85` °C） |
 | `TrafficResetDay` | `1` | 每月流量统计周期重置日（`1 ~ 31`，小月自动按月底对齐） |
-| `ProxyProcessNames` | `"sing-box,xray,mihomo,v2ray"` | 计入代理流量的进程名列表（逗号分隔，通过内核 ETW 排除回环统计） |
-| `LocalProxyPorts` | 空 | 补充识别按应用流量时使用的本机 HTTP / SOCKS 代理端口 |
+| `ProxyProcessNames` | `"sing-box,xray,mihomo,v2ray"` | 代理核心的进程名，多个用逗号分隔 |
+| `LocalProxyPorts` | 空 | 应用另行使用的本机 HTTP / SOCKS 代理入口，多个用逗号分隔 |
+| `ProxyNodeEndpoints` | 自动 | 实际代理节点的 `主机:端口`，多个用逗号分隔，IPv6 用 `[地址]:端口` |
+| `ProxyController` | 自动 | 本机 Clash 兼容控制器的 `地址:端口`，例如 `127.0.0.1:9090` |
+| `ApplicationGroups` | 空 | 手动归并规则数组，每项为 `后台进程完整路径=主程序完整路径` |
 
 每日流量历史记录持久化保存于 `%APPDATA%\SysTelemetry\traffic.json`（保留近 400 天，变更重置日后自动即时重算当期及历史月度周期）。
 
 ### 代理流量怎么设置
 
-打开面板右上角的齿轮，在「流量」设置中填写：
+使用管理员权限运行 SysTelemetry 后，打开面板右上角的齿轮，在「流量」设置中填写：
 
 1. **流量重置日**决定每月统计周期从哪一天开始。按自然月查看，保持每月 1 日。
-2. **代理进程**用于「总览」统计代理核心的对外收发。在任务管理器的「详细信息」里找到代理核心。例如看到 `sing-box.exe`，填 `sing-box` 并按回车。多个核心用逗号分隔，也可点「默认」恢复常见核心。留空会停止新增总览代理流量。
+2. **代理进程**用于识别代理核心。在任务管理器的「详细信息」里找到核心。例如看到 `sing-box.exe`，填 `sing-box` 并按回车。也可点「默认」恢复常见核心。
 3. **额外本机代理端口（选填）**用于「按应用」识别经过本机代理的流量。程序自动读取 Windows 保存的本机代理地址。如果应用单独配置了代理地址，例如 `127.0.0.1:10808`，也可以在此填 `10808` 并按回车。多个端口用逗号分隔，只填代理软件实际提供的 HTTP / SOCKS 入口端口。
 4. **统计记录**中的「重置今日」和「清空全部」用于删除已累计的统计。日常使用可跳过。
 
-以 v2rayN 使用 sing-box、应用的代理地址为 `127.0.0.1:10808` 为例，代理进程填 `sing-box`，可在额外端口填 `10808`。打开「流量统计 → 按应用」，「代理」列会显示每个应用已交给该本机代理的下载与上传合计。这部分包含在应用的「合计」里。旧记录的「代理」列从新版启动后开始累计。代理核心的对外收发在总览里查看，按应用的「代理」列依据应用连接的本机代理入口计量。
+#### 按代理软件配置
+
+| 电脑上的代理 | 需要配置什么 |
+| :--- | :--- |
+| v2rayN + sing-box | 自动读取运行中的 v2rayN 生成的节点地址和控制器。v2rayN 的节点和对应协议默认核心可设为 `sing-box`。应用明细依赖 sing-box 的 `route.find_process: true` 和本机 Clash API。 |
+| Mihomo、Clash 或独立运行的 sing-box | 填好核心进程名，在配置文件加上 `ProxyNodeEndpoints` 和 `ProxyController`。控制器只需监听回环地址。启用代理核心的进程识别，例如 Mihomo 的 `find-process-mode: strict`。 |
+| Xray 或没有 Clash 兼容 API 的代理 | 填核心进程名和 `ProxyNodeEndpoints`。总览可统计节点收发。应用直接出网仍会计入直连，经本机代理且缺少路由信息的连接显示为未分类。 |
+
+v2rayN 会定期清理生成的核心配置。SysTelemetry 识别后会为该次核心运行保留节点和控制器信息。如果首次启动 SysTelemetry 时配置已经被清理，在 v2rayN 中重启核心即可重新识别。
+
+手动设置时先从托盘退出 SysTelemetry，在 `%APPDATA%\SysTelemetry\config.json` 中添加这两个字段，再启动。把示例节点替换成代理配置里的实际服务器和端口。控制器与本机 HTTP / SOCKS 入口使用各自的地址。有控制器密钥时，在启动 SysTelemetry 的环境中设置 `SYSTELEMETRY_PROXY_CONTROLLER_TOKEN`。
+
+```json
+{
+  "ProxyNodeEndpoints": "node.example.com:443,backup.example.com:8443",
+  "ProxyController": "127.0.0.1:9090"
+}
+```
+
+#### 怎么读流量数字
+
+- **全局**是物理网卡全部收发。**总览 → 代理**计量代理核心与节点间的双向流量。同一个流量包有多个节点时，填写这些节点的实际地址。这个数字按本机测量，服务商的扣费口径可能有差异。
+- **按应用**中，「代理」统计控制器确认由代理节点转发的应用流量。「直连」包括应用直接出网和控制器报告的直连路线。应用明细读取核心连接快照，短到未进入快照的连接以及缺少进程信息的流量可能无法分类。总览靠系统网络事件计量节点流量，因此按应用的代理合计可能与总览不同。
+- 节点地址无法解析、代理核心不提供路由数据或记录来自旧版本时，无法确认的部分显示为「未分类」。
+
+#### 应用和后台进程
+
+「按应用」会按 Windows 应用包身份或可执行文件的完整路径归并流量。同一安装目录下、由该应用启动的后台进程也会归到应用行。例如 Antigravity 启动的 `language_server.exe` 会显示在 Antigravity 下。点击应用行可展开各进程的合计、代理、直连和未分类用量。共享的系统服务和 WebView2 运行时单列。缺少路径的旧记录保留为带「旧」标记的行。
+
+如果应用的专用后台进程由服务或计划任务独立启动，可以退出 SysTelemetry 后，在配置文件中添加精确路径规则，再重新启动。规则适用于之后记录的流量。
+
+```json
+{
+  "ApplicationGroups": [
+    "C:\\ExampleApp\\background\\helper.exe=C:\\ExampleApp\\ExampleApp.exe"
+  ]
+}
+```
 
 ---
 
@@ -131,7 +171,9 @@ SysTelemetry/
 │   ├── AutoStartService.cs       # 任务计划程序 / 注册表开机自启管理
 │   ├── TelemetryService.cs       # LibreHardwareMonitor + 性能计数器硬件采样引擎
 │   ├── ThemeHelper.cs            # 深浅主题调色板、状态着色与固定宽度格式化
-│   └── TrafficMonitorService.cs  # 物理网卡全局统计 + Windows 内核 ETW 代理流量统计引擎
+│   ├── ApplicationProcessCatalog.cs # Windows 进程身份与应用归并
+│   ├── TrafficMonitorService.cs  # 物理网卡全局统计和 ETW 节点流量
+│   └── SingBoxTrafficRoutes.cs   # v2rayN 节点发现和 Clash 兼容 API 路由归类
 ├── UI/
 │   ├── DesktopOverlayWindow.cs   # 桌面单行透明悬浮角标窗口
 │   ├── IconFactory.cs            # 矢量 SVG 图标与动态托盘图标生成器

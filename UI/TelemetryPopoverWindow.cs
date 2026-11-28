@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
@@ -348,7 +349,7 @@ namespace SysTelemetry.UI
             _netSummaryProxy.Text = t.GlobalTotal > 0
                 ? string.Format("代理 {0} · {1:0}%", ThemeHelper.FormatDataSize(t.ProxyTotal, compact: true), t.ProxyRatio * 100.0)
                 : "代理 0B";
-            UpdateStackedRatioBar(_netSummaryBarTrack, _netSummaryBarProxy, t.GlobalTotal, t.ProxyRatio, pal);
+            UpdateStackedRatioBar(_netSummaryBarTrack, _netSummaryBarProxy, t.GlobalTotal, t.ProxyRatio, pal, t.DirectTotal);
         }
 
         private void UpdateTrafficView(TelemetrySnapshot snap, ThemePalette pal)
@@ -381,14 +382,13 @@ namespace SysTelemetry.UI
                     ThemeHelper.FormatDataSize(today.GlobalRx, compact: true),
                     ThemeHelper.FormatDataSize(today.GlobalTx, compact: true));
                 _tfTodayProxyMain.Text = ThemeHelper.FormatDataSize(today.ProxyTotal);
+                _tfTodayProxyMain.ToolTip = string.Format("{0:N0} B", today.ProxyTotal);
                 _tfTodayProxySub.Text = string.Format("↓ {0}  ↑ {1}",
                     ThemeHelper.FormatDataSize(today.ProxyRx, compact: true),
                     ThemeHelper.FormatDataSize(today.ProxyTx, compact: true));
                 _tfTodayProxyBadgeText.Text = string.Format("{0:0.0}%", today.ProxyRatio * 100.0);
-                UpdateStackedRatioBar(_tfTodayBarTrack, _tfTodayBarProxy, today.GlobalTotal, today.ProxyRatio, pal);
-                _tfTodayDirectText.Text = string.Format("直连 {0} ({1:0.0}%)",
-                    ThemeHelper.FormatDataSize(today.DirectTotal),
-                    today.GlobalTotal > 0 ? (1.0 - today.ProxyRatio) * 100.0 : 0.0);
+                UpdateStackedRatioBar(_tfTodayBarTrack, _tfTodayBarProxy, today.GlobalTotal, today.ProxyRatio, pal, today.DirectTotal);
+                _tfTodayDirectText.Text = FormatTrafficBreakdown(today);
                 _tfTodayRatioText.Text = string.Format("代理 {0:0.0}%", today.ProxyRatio * 100.0);
             }
 
@@ -408,10 +408,8 @@ namespace SysTelemetry.UI
                     ThemeHelper.FormatDataSize(cycle.ProxyRx, compact: true),
                     ThemeHelper.FormatDataSize(cycle.ProxyTx, compact: true));
                 _tfMonthProxyBadgeText.Text = string.Format("{0:0.0}%", cycle.ProxyRatio * 100.0);
-                UpdateStackedRatioBar(_tfMonthBarTrack, _tfMonthBarProxy, cycle.GlobalTotal, cycle.ProxyRatio, pal);
-                _tfMonthDirectText.Text = string.Format("直连 {0} ({1:0.0}%)",
-                    ThemeHelper.FormatDataSize(cycle.DirectTotal),
-                    cycle.GlobalTotal > 0 ? (1.0 - cycle.ProxyRatio) * 100.0 : 0.0);
+                UpdateStackedRatioBar(_tfMonthBarTrack, _tfMonthBarProxy, cycle.GlobalTotal, cycle.ProxyRatio, pal, cycle.DirectTotal);
+                _tfMonthDirectText.Text = FormatTrafficBreakdown(cycle);
                 _tfMonthRatioText.Text = string.Format("代理 {0:0.0}%", cycle.ProxyRatio * 100.0);
             }
 
@@ -419,7 +417,15 @@ namespace SysTelemetry.UI
             RenderTrafficHistory(series, pal);
         }
 
-        private static void UpdateStackedRatioBar(Border track, Border proxyFill, long globalTotal, double proxyRatio, ThemePalette pal)
+        private static string FormatTrafficBreakdown(TrafficPeriodSummary item)
+        {
+            string direct = "直连 " + ThemeHelper.FormatDataSize(item.DirectTotal);
+            if (item.UnclassifiedTotal == 0) return direct;
+            return direct + " · 未分类 " + ThemeHelper.FormatDataSize(item.UnclassifiedTotal);
+        }
+
+        private static void UpdateStackedRatioBar(Border track, Border proxyFill, long globalTotal, double proxyRatio,
+            ThemePalette pal, long directTotal = 0)
         {
             if (track == null || proxyFill == null) return;
             double trackWidth = track.ActualWidth > 10 ? track.ActualWidth : 304.0;
@@ -430,7 +436,16 @@ namespace SysTelemetry.UI
                 return;
             }
 
-            track.Background = pal.DirectBarBrush;
+            // The right-aligned proxy overlay covers the right side of the track.
+            double directRatio = Math.Min(1.0, (double)directTotal / globalTotal);
+            var background = new LinearGradientBrush { StartPoint = new Point(0, 0), EndPoint = new Point(1, 0) };
+            Color direct = ((SolidColorBrush)pal.DirectBarBrush).Color;
+            Color unknown = ((SolidColorBrush)pal.TrackBackground).Color;
+            background.GradientStops.Add(new GradientStop(direct, 0));
+            background.GradientStops.Add(new GradientStop(direct, directRatio));
+            background.GradientStops.Add(new GradientStop(unknown, directRatio));
+            background.GradientStops.Add(new GradientStop(unknown, 1));
+            track.Background = background;
             proxyFill.Background = pal.ProxyBarBrush;
             double clamped = Math.Max(0.0, Math.Min(1.0, proxyRatio));
             double px = clamped * trackWidth;
@@ -472,7 +487,7 @@ namespace SysTelemetry.UI
                 _tfChartLabelsGrid.ColumnDefinitions.Add(new ColumnDefinition());
 
                 string tipText = string.Format(
-                    "{0}\n全局: {1} (↓ {2} / ↑ {3})\n代理: {4} (↓ {5} / ↑ {6})\n直连: {7} · 代理占比 {8:0.0}%",
+                    "{0}\n全局: {1} (↓ {2} / ↑ {3})\n代理: {4} (↓ {5} / ↑ {6})\n{7} · 代理占比 {8:0.0}%",
                     item.RangeText,
                     ThemeHelper.FormatDataSize(item.GlobalTotal),
                     ThemeHelper.FormatDataSize(item.GlobalRx),
@@ -480,7 +495,7 @@ namespace SysTelemetry.UI
                     ThemeHelper.FormatDataSize(item.ProxyTotal),
                     ThemeHelper.FormatDataSize(item.ProxyRx),
                     ThemeHelper.FormatDataSize(item.ProxyTx),
-                    ThemeHelper.FormatDataSize(item.DirectTotal),
+                    FormatTrafficBreakdown(item),
                     item.ProxyRatio * 100.0);
 
                 var colHost = new Border
@@ -516,7 +531,11 @@ namespace SysTelemetry.UI
                     double totalH = Math.Max(3.0, ((double)item.GlobalTotal / maxVal) * maxBarHeight);
                     double proxyH = item.ProxyTotal > 0 ? Math.Max(2.0, totalH * item.ProxyRatio) : 0.0;
                     if (proxyH > totalH) proxyH = totalH;
-                    double directH = Math.Max(0.0, totalH - proxyH);
+                    double directH = Math.Min(totalH - proxyH, totalH * item.DirectTotal / item.GlobalTotal);
+                    double unknownH = Math.Max(0, totalH - proxyH - directH);
+
+                    if (unknownH > 0.5)
+                        barStack.Children.Add(new Border { Width = barWidth, Height = unknownH, Background = pal.TrackBackground });
 
                     if (directH > 0.5)
                     {
@@ -573,7 +592,7 @@ namespace SysTelemetry.UI
             {
                 var item = items[i];
                 string rowTip = string.Format(
-                    "{0}\n全局: {1} (↓ {2} / ↑ {3})\n代理: {4} (↓ {5} / ↑ {6})\n直连: {7}",
+                    "{0}\n全局: {1} (↓ {2} / ↑ {3})\n代理: {4} (↓ {5} / ↑ {6})\n{7}",
                     item.RangeText,
                     ThemeHelper.FormatDataSize(item.GlobalTotal),
                     ThemeHelper.FormatDataSize(item.GlobalRx),
@@ -581,7 +600,7 @@ namespace SysTelemetry.UI
                     ThemeHelper.FormatDataSize(item.ProxyTotal),
                     ThemeHelper.FormatDataSize(item.ProxyRx),
                     ThemeHelper.FormatDataSize(item.ProxyTx),
-                    ThemeHelper.FormatDataSize(item.DirectTotal));
+                    FormatTrafficBreakdown(item));
 
                 var rowBorder = new Border
                 {
@@ -1282,10 +1301,11 @@ namespace SysTelemetry.UI
         private void BuildApplicationTrafficView()
         {
             var header = MakeApplicationTrafficRow(true);
-            string[] labels = { "应用 / 进程", "下载 ↓", "上传 ↑", "合计", "代理" };
+            string[] labels = { "应用", "合计", "代理", "直连", "未分类" };
             for (int i = 0; i < labels.Length; i++)
                 ((TextBlock)header.Children[i]).Text = labels[i];
-            ((TextBlock)header.Children[4]).ToolTip = "应用经本机代理端口的下载与上传合计，包含在本行合计内。";
+            ((TextBlock)header.Children[2]).ToolTip = "由实际代理节点转发的上传和下载合计。";
+            ((TextBlock)header.Children[4]).ToolTip = "历史记录或未能确认出站路线的流量。";
             _applicationTrafficView.Children.Add(header);
 
             _applicationRows = new StackPanel();
@@ -1311,34 +1331,78 @@ namespace SysTelemetry.UI
             _applicationTrafficView.Children.Add(_applicationEmpty);
         }
 
+        private readonly HashSet<string> _expandedApplications = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         private void RenderApplicationTraffic(bool etwActive, ThemePalette pal)
         {
             var items = _getApplicationTraffic(_applicationCycleMode);
             _applicationEmpty.Visibility = items.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
             _applicationEmpty.Text = etwActive ? "暂无应用流量" : "应用流量采集未启动";
-            while (_applicationRows.Children.Count > items.Count)
-                _applicationRows.Children.RemoveAt(_applicationRows.Children.Count - 1);
 
+            int rowIndex = 0;
             for (int i = 0; i < items.Count; i++)
             {
-                if (i == _applicationRows.Children.Count)
-                    _applicationRows.Children.Add(MakeApplicationTrafficRow(false));
-                var row = (Grid)_applicationRows.Children[i];
-                var name = (TextBlock)row.Children[0];
-                name.Text = items[i].Key;
-                name.ToolTip = items[i].Key;
-                var traffic = items[i].Value;
-                ((TextBlock)row.Children[1]).Text = ThemeHelper.FormatDataSize(traffic.Received);
-                ((TextBlock)row.Children[2]).Text = ThemeHelper.FormatDataSize(traffic.Sent);
-                ((TextBlock)row.Children[3]).Text = ThemeHelper.FormatDataSize(traffic.Total);
-                var proxy = (TextBlock)row.Children[4];
-                proxy.Text = traffic.LocalProxyBytes.HasValue
-                    ? ThemeHelper.FormatDataSize(traffic.LocalProxyBytes.Value)
-                    : "—";
-                proxy.ToolTip = traffic.LocalProxyBytes.HasValue ? null : "旧记录无代理明细";
-                row.Background = i % 2 == 0 ? pal.SubSurfaceBackground : Brushes.Transparent;
-                ApplyPaletteToTree(row, pal);
+                var item = items[i];
+                var traffic = item.Value;
+                bool expandable = traffic.Processes != null && traffic.Processes.Count > 0;
+                bool expanded = expandable && _expandedApplications.Contains(item.Key);
+                string label = traffic.ApplicationName ?? item.Key + "（旧）";
+                UpdateApplicationRow(rowIndex++, item.Key, label, traffic, pal, i % 2 == 0, expandable, expanded, false);
+                if (!expanded) continue;
+                foreach (var process in traffic.Processes.OrderByDescending(p => p.Value.Total)
+                    .ThenBy(p => p.Key, StringComparer.OrdinalIgnoreCase))
+                {
+                    UpdateApplicationRow(rowIndex++, process.Key, process.Value.ApplicationName ?? process.Key,
+                        process.Value, pal, false, false, false, true);
+                }
             }
+            while (_applicationRows.Children.Count > rowIndex)
+                _applicationRows.Children.RemoveAt(_applicationRows.Children.Count - 1);
+        }
+
+        private void UpdateApplicationRow(int index, string key, string label, ApplicationTraffic traffic,
+            ThemePalette pal, bool stripe, bool expandable, bool expanded, bool isDetail)
+        {
+            if (index == _applicationRows.Children.Count)
+            {
+                var newRow = MakeApplicationTrafficRow(false);
+                newRow.MouseLeftButtonUp += (sender, args) => ToggleApplicationRow(newRow);
+                newRow.KeyDown += (sender, args) =>
+                {
+                    if (args.Key != Key.Enter && args.Key != Key.Space) return;
+                    args.Handled = ToggleApplicationRow(newRow);
+                };
+                _applicationRows.Children.Add(newRow);
+            }
+            var row = (Grid)_applicationRows.Children[index];
+            row.Tag = expandable ? key : null;
+            row.Focusable = expandable;
+            row.Cursor = expandable ? Cursors.Hand : Cursors.Arrow;
+            System.Windows.Automation.AutomationProperties.SetName(row,
+                expandable ? (expanded ? "折叠 " : "展开 ") + label : label);
+
+            var name = (TextBlock)row.Children[0];
+            name.Margin = new Thickness(isDetail ? 22 : 7, 0, 5, 0);
+            name.Text = expandable ? (expanded ? "▾ " : "▸ ") + label : label;
+            name.ToolTip = key + string.Format("\n采集收发 ↓ {0}  ↑ {1}",
+                ThemeHelper.FormatDataSize(traffic.Received), ThemeHelper.FormatDataSize(traffic.Sent));
+            ((TextBlock)row.Children[1]).Text = ThemeHelper.FormatDataSize(traffic.Total);
+            var proxy = (TextBlock)row.Children[2];
+            proxy.Text = ThemeHelper.FormatDataSize(traffic.NodeBytes);
+            proxy.ToolTip = string.Format("{0:N0} B", traffic.NodeBytes);
+            ((TextBlock)row.Children[3]).Text = ThemeHelper.FormatDataSize(traffic.DirectBytes);
+            ((TextBlock)row.Children[4]).Text = ThemeHelper.FormatDataSize(traffic.UnclassifiedBytes);
+            row.Background = stripe ? pal.SubSurfaceBackground : Brushes.Transparent;
+            ApplyPaletteToTree(row, pal);
+        }
+
+        private bool ToggleApplicationRow(Grid row)
+        {
+            string key = row.Tag as string;
+            if (key == null) return false;
+            if (!_expandedApplications.Add(key)) _expandedApplications.Remove(key);
+            RenderApplicationTraffic(_lastSnap.Traffic.EtwActive, ThemeHelper.GetPalette(_config.Theme));
+            return true;
         }
 
         private static Grid MakeApplicationTrafficRow(bool header)
@@ -1358,7 +1422,7 @@ namespace SysTelemetry.UI
                 {
                     FontFamily = i == 0 || header ? UiFont : MonoFont,
                     FontSize = header ? 10 : 11,
-                    FontWeight = i == 3 && !header ? FontWeights.SemiBold : FontWeights.Normal,
+                    FontWeight = i == 1 && !header ? FontWeights.SemiBold : FontWeights.Normal,
                     Margin = i == 0 ? new Thickness(7, 0, 5, 0) : new Thickness(0, 0, 7, 0),
                     TextAlignment = i == 0 ? TextAlignment.Left : TextAlignment.Right,
                     TextTrimming = TextTrimming.CharacterEllipsis,
@@ -1835,7 +1899,7 @@ namespace SysTelemetry.UI
                 Padding = new Thickness(6, 4, 6, 4),
                 BorderThickness = new Thickness(0),
                 Background = Brushes.Transparent,
-                ToolTip = "填代理核心的进程名，如 sing-box。多个名称用逗号分隔，留空关闭总览代理统计，按回车保存。",
+                ToolTip = "填代理核心的进程名，如 sing-box 或 mihomo。多个名称用逗号分隔，按回车保存。",
                 Tag = "ConfigInput"
             };
             _txtProxyProcesses.KeyDown += (s, e) =>

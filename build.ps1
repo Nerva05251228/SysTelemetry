@@ -44,6 +44,8 @@ $sources = @(
     (Join-Path $root 'Services\ThemeHelper.cs'),
     (Join-Path $root 'Services\AutoStartService.cs'),
     (Join-Path $root 'Services\TrafficMonitorService.cs'),
+    (Join-Path $root 'Services\ApplicationProcessCatalog.cs'),
+    (Join-Path $root 'Services\SingBoxTrafficRoutes.cs'),
     (Join-Path $root 'Services\TelemetryService.cs'),
     (Join-Path $root 'UI\IconFactory.cs'),
     (Join-Path $root 'UI\WidgetVisualBuilder.cs'),

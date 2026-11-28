@@ -47,6 +47,9 @@ namespace SysTelemetry.Models
         [DataMember] public int TrafficResetDay { get; set; }
         [DataMember] public string ProxyProcessNames { get; set; }
         [DataMember(EmitDefaultValue = false)] public string LocalProxyPorts { get; set; }
+        [DataMember(EmitDefaultValue = false)] public string ProxyNodeEndpoints { get; set; }
+        [DataMember(EmitDefaultValue = false)] public string ProxyController { get; set; }
+        [DataMember(EmitDefaultValue = false)] public string[] ApplicationGroups { get; set; }
 
         public AppConfig()
         {
