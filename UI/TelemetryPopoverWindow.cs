@@ -89,6 +89,9 @@ namespace SysTelemetry.UI
         private StackPanel _trafficOverview;
         private StackPanel _applicationTrafficView;
         private StackPanel _applicationRows;
+        private readonly List<Button> _applicationSortButtons = new List<Button>();
+        private ApplicationTrafficColumn _applicationSortColumn = ApplicationTrafficColumn.Total;
+        private bool _applicationSortDescending = true;
         private Border _applicationPeriodSelector;
         private TextBlock _applicationEmpty;
         private TextBlock _tfTodaySectionTitle;
@@ -1298,14 +1301,36 @@ namespace SysTelemetry.UI
             _trafficView.Children.Add(footer);
         }
 
+        private enum ApplicationTrafficColumn
+        {
+            Name, Total, Proxy, Direct, Unclassified
+        }
+
+        private static readonly string[] ApplicationTrafficLabels = { "应用", "合计", "代理", "直连", "未分类" };
+
         private void BuildApplicationTrafficView()
         {
             var header = MakeApplicationTrafficRow(true);
-            string[] labels = { "应用", "合计", "代理", "直连", "未分类" };
-            for (int i = 0; i < labels.Length; i++)
-                ((TextBlock)header.Children[i]).Text = labels[i];
-            ((TextBlock)header.Children[2]).ToolTip = "由实际代理节点转发的上传和下载合计。";
-            ((TextBlock)header.Children[4]).ToolTip = "历史记录或未能确认出站路线的流量。";
+            var template = MakeSegmentButtonTemplate();
+            for (int i = 0; i < ApplicationTrafficLabels.Length; i++)
+            {
+                var column = (ApplicationTrafficColumn)i;
+                var button = new Button
+                {
+                    FontFamily = UiFont,
+                    FontSize = 10,
+                    HorizontalAlignment = i == 0 ? HorizontalAlignment.Left : HorizontalAlignment.Right,
+                    Padding = new Thickness(7, 0, 7, 0),
+                    BorderThickness = new Thickness(0),
+                    Background = Brushes.Transparent,
+                    Cursor = Cursors.Hand,
+                    Template = template
+                };
+                button.Click += (sender, args) => SortApplicationsBy(column);
+                Grid.SetColumn(button, i);
+                header.Children.Add(button);
+                _applicationSortButtons.Add(button);
+            }
             _applicationTrafficView.Children.Add(header);
 
             _applicationRows = new StackPanel();
@@ -1333,6 +1358,62 @@ namespace SysTelemetry.UI
 
         private readonly HashSet<string> _expandedApplications = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+        private void SortApplicationsBy(ApplicationTrafficColumn column)
+        {
+            _applicationSortDescending = _applicationSortColumn == column
+                ? !_applicationSortDescending : column != ApplicationTrafficColumn.Name;
+            _applicationSortColumn = column;
+            var palette = ThemeHelper.GetPalette(_config.Theme);
+            UpdateApplicationSortHeaders(palette);
+            if (_lastSnap != null && _lastSnap.Traffic != null)
+                RenderApplicationTraffic(_lastSnap.Traffic.EtwActive, palette);
+        }
+
+        private void UpdateApplicationSortHeaders(ThemePalette palette)
+        {
+            for (int i = 0; i < _applicationSortButtons.Count; i++)
+            {
+                var column = (ApplicationTrafficColumn)i;
+                bool selected = column == _applicationSortColumn;
+                string label = ApplicationTrafficLabels[i];
+                var button = _applicationSortButtons[i];
+                button.Content = selected ? label + (_applicationSortDescending ? " ↓" : " ↑") : label;
+                button.Foreground = selected ? palette.AccentPrimary : palette.TaskbarTextMuted;
+                button.FontWeight = selected ? FontWeights.SemiBold : FontWeights.Normal;
+                string direction = _applicationSortDescending ? "降序" : "升序";
+                System.Windows.Automation.AutomationProperties.SetName(button, selected ? label + "，" + direction : label);
+                string help = selected ? "当前" + direction + "，点击切换" : "按" + label + "排序";
+                if (column == ApplicationTrafficColumn.Proxy)
+                    help += "。统计代理节点转发的双向流量。";
+                else if (column == ApplicationTrafficColumn.Unclassified)
+                    help += "。包含旧记录和未能确认出站路线的流量。";
+                button.ToolTip = help;
+            }
+        }
+
+        private IOrderedEnumerable<KeyValuePair<string, ApplicationTraffic>> OrderApplicationTraffic(
+            IEnumerable<KeyValuePair<string, ApplicationTraffic>> items)
+        {
+            var comparer = StringComparer.CurrentCultureIgnoreCase;
+            Func<KeyValuePair<string, ApplicationTraffic>, string> name = item => item.Value.ApplicationName ?? item.Key;
+            if (_applicationSortColumn == ApplicationTrafficColumn.Name)
+            {
+                var byName = _applicationSortDescending ? items.OrderByDescending(name, comparer) : items.OrderBy(name, comparer);
+                return byName.ThenBy(item => item.Key, StringComparer.OrdinalIgnoreCase);
+            }
+
+            Func<KeyValuePair<string, ApplicationTraffic>, long> bytes;
+            switch (_applicationSortColumn)
+            {
+                case ApplicationTrafficColumn.Proxy: bytes = item => item.Value.NodeBytes; break;
+                case ApplicationTrafficColumn.Direct: bytes = item => item.Value.DirectBytes; break;
+                case ApplicationTrafficColumn.Unclassified: bytes = item => item.Value.UnclassifiedBytes; break;
+                default: bytes = item => item.Value.Total; break;
+            }
+            var byBytes = _applicationSortDescending ? items.OrderByDescending(bytes) : items.OrderBy(bytes);
+            return byBytes.ThenBy(name, comparer).ThenBy(item => item.Key, StringComparer.OrdinalIgnoreCase);
+        }
+
         private void RenderApplicationTraffic(bool etwActive, ThemePalette pal)
         {
             var items = _getApplicationTraffic(_applicationCycleMode);
@@ -1340,17 +1421,16 @@ namespace SysTelemetry.UI
             _applicationEmpty.Text = etwActive ? "暂无应用流量" : "应用流量采集未启动";
 
             int rowIndex = 0;
-            for (int i = 0; i < items.Count; i++)
+            int applicationIndex = 0;
+            foreach (var item in OrderApplicationTraffic(items))
             {
-                var item = items[i];
                 var traffic = item.Value;
                 bool expandable = traffic.Processes != null && traffic.Processes.Count > 0;
                 bool expanded = expandable && _expandedApplications.Contains(item.Key);
                 string label = traffic.ApplicationName ?? item.Key + "（旧）";
-                UpdateApplicationRow(rowIndex++, item.Key, label, traffic, pal, i % 2 == 0, expandable, expanded, false);
+                UpdateApplicationRow(rowIndex++, item.Key, label, traffic, pal, applicationIndex++ % 2 == 0, expandable, expanded, false);
                 if (!expanded) continue;
-                foreach (var process in traffic.Processes.OrderByDescending(p => p.Value.Total)
-                    .ThenBy(p => p.Key, StringComparer.OrdinalIgnoreCase))
+                foreach (var process in OrderApplicationTraffic(traffic.Processes))
                 {
                     UpdateApplicationRow(rowIndex++, process.Key, process.Value.ApplicationName ?? process.Key,
                         process.Value, pal, false, false, false, true);
@@ -1418,16 +1498,16 @@ namespace SysTelemetry.UI
                 {
                     Width = i == 0 ? new GridLength(1, GridUnitType.Star) : new GridLength(58)
                 });
+                if (header) continue;
                 var cell = new TextBlock
                 {
-                    FontFamily = i == 0 || header ? UiFont : MonoFont,
-                    FontSize = header ? 10 : 11,
-                    FontWeight = i == 1 && !header ? FontWeights.SemiBold : FontWeights.Normal,
+                    FontFamily = i == 0 ? UiFont : MonoFont,
+                    FontSize = 11,
+                    FontWeight = i == 1 ? FontWeights.SemiBold : FontWeights.Normal,
                     Margin = i == 0 ? new Thickness(7, 0, 5, 0) : new Thickness(0, 0, 7, 0),
                     TextAlignment = i == 0 ? TextAlignment.Left : TextAlignment.Right,
                     TextTrimming = TextTrimming.CharacterEllipsis,
-                    VerticalAlignment = VerticalAlignment.Center,
-                    Tag = header ? "Muted" : null
+                    VerticalAlignment = VerticalAlignment.Center
                 };
                 Typography.SetNumeralAlignment(cell, FontNumeralAlignment.Tabular);
                 Grid.SetColumn(cell, i);
@@ -2197,6 +2277,7 @@ namespace SysTelemetry.UI
             HighlightSelected(_trafficHistoryButtons, _trafficMonthlyMode, pal);
             HighlightSelected(_trafficViewButtons, _showApplicationTraffic, pal);
             HighlightSelected(_applicationPeriodButtons, _applicationCycleMode, pal);
+            UpdateApplicationSortHeaders(pal);
             UpdateOffsetReadout();
 
             if (_lastSnap != null)
